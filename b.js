@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 10;
+    var BQ_VERSION = 11;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -367,11 +367,16 @@
                         '?link=' + hash + '&index=' + idx + '&play';
                 }
 
+                function timelineOf(f) {
+                    try { return Lampa.Timeline.view(hash + '_' + (f.id || f.path)); }
+                    catch (e) { return card.timeline; }
+                }
+
                 // Фільм або одиночний файл — граємо одразу
                 if (!curIsSeries || videos.length === 1) {
                     var video = videos.sort(function (a, b) { return b.length - a.length; })[0];
 
-                    Lampa.Player.play({ url: streamOf(video, 0), title: title, timeline: card.timeline, quality: false });
+                    Lampa.Player.play({ url: streamOf(video, 0), title: title, timeline: timelineOf(video), quality: false });
                     Lampa.Player.playlist([{ url: streamOf(video, 0), title: title }]);
                     return;
                 }
@@ -396,7 +401,7 @@
                 });
 
                 var playlist = videos.map(function (f, i) {
-                    return { url: streamOf(f, i), title: f.path.split('/').pop() };
+                    return { url: streamOf(f, i), title: f.path.split('/').pop(), timeline: timelineOf(f) };
                 });
 
                 Lampa.Select.show({
@@ -409,7 +414,7 @@
                         Lampa.Player.play({
                             url: playlist[item.index].url,
                             title: playlist[item.index].title,
-                            timeline: card.timeline,
+                            timeline: playlist[item.index].timeline,
                             quality: false
                         });
                         Lampa.Player.playlist(playlist);
