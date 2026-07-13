@@ -45,12 +45,19 @@
         else if (/webrip/.test(t))      score += 60;
         else if (/hdtv/.test(t))        score += 30;
 
-        // HDR / Dolby Vision
-        var hdrOn = cfg('hdr', true);
-        if (hdrOn === true || hdrOn === 'true') {
-            if (/dolby.?vision|\bdv\b/.test(t)) score += 120;
-            if (/hdr10\+/.test(t))              score += 100;
-            else if (/hdr/.test(t))             score += 80;
+        // HDR / Dolby Vision — залежить від можливостей телевізора
+        var hdrMode = cfg('hdr', 'prefer');
+        var hasDV  = /dolby.?vision|\bdv\b/.test(t);
+        var hasHDR = /hdr/.test(t);
+
+        if (hdrMode === 'avoid') {
+            // SDR-телевізор: HDR/DV дає темну блеклу картинку — відкидаємо
+            if (hasDV || hasHDR) return -1;
+        }
+        else if (hdrMode === 'prefer' || hdrMode === true || hdrMode === 'true') {
+            if (hasDV)                score += 120;
+            if (/hdr10\+/.test(t))    score += 100;
+            else if (hasHDR)          score += 80;
         }
 
         // Кодек
@@ -309,8 +316,8 @@
 
         Lampa.SettingsApi.addParam({
             component: 'best_quality',
-            param: { name: STORE.hdr, type: 'trigger', default: true },
-            field: { name: 'Пріоритет HDR і Dolby Vision' }
+            param: { name: STORE.hdr, type: 'select', values: { prefer: 'Перевага HDR/DV', ignore: 'Не враховувати', avoid: 'Уникати (мій ТБ без HDR)' }, default: 'prefer' },
+            field: { name: 'HDR і Dolby Vision', description: 'Якщо ТБ без HDR — такі релізи виглядають темними, обери «Уникати»' }
         });
 
         Lampa.SettingsApi.addParam({
