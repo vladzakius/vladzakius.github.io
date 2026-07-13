@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 7;
+    var BQ_VERSION = 8;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -291,6 +291,39 @@
         }, fail);
     }
 
+    // Які сезони реально лежать у файлах роздачі та чи є там обраний
+    function filesForSeason(videos, season) {
+        function seasonsOf(path) {
+            var p = path.toLowerCase();
+            var out = {}, m;
+            var re1 = /s(\d{1,2})e\d/g;
+            while ((m = re1.exec(p))) out[parseInt(m[1], 10)] = true;
+            var re2 = /\b(\d{1,2})x\d{2}\b/g;
+            while ((m = re2.exec(p))) out[parseInt(m[1], 10)] = true;
+            var re3 = /(?:season|сезон)[\s._:№-]*(\d{1,2})/g;
+            while ((m = re3.exec(p))) out[parseInt(m[1], 10)] = true;
+            return Object.keys(out).map(Number);
+        }
+
+        var bySeason = videos.filter(function (f) {
+            return seasonsOf(f.path).indexOf(season) !== -1;
+        });
+
+        if (bySeason.length) return { files: bySeason, wrong: null };
+
+        // Обраного сезону немає. Якщо файли взагалі марковані — пак не той
+        var present = {};
+        videos.forEach(function (f) {
+            seasonsOf(f.path).forEach(function (n) { present[n] = true; });
+        });
+        var marked = Object.keys(present).map(Number).sort(function (a, b) { return a - b; });
+
+        if (marked.length) return { files: [], wrong: marked };
+
+        // Файли без маркерів сезону (одинарний немаркований пак) — довіряємо назві роздачі
+        return { files: videos, wrong: null };
+    }
+
     function playInTorrserve(item, card, onDead) {
         var link = item.MagnetUri || item.Link;
         var title = card.title || card.name;
@@ -339,11 +372,18 @@
                     return;
                 }
 
-                // Серіал: якщо пак багатосезонний — лишаємо файли обраного сезону
+                // Серіал: якщо пак не містить обраного сезону — це не наш пак
                 if (curSeason > 0) {
-                    var reEp = new RegExp('s0?' + curSeason + 'e\\d|\\b0?' + curSeason + 'x\\d{2}|season[\\s._]*0?' + curSeason + '\\b|сезон[\\s._:№]*0?' + curSeason + '\\b', 'i');
-                    var ofSeason = videos.filter(function (f) { return reEp.test(f.path); });
-                    if (ofSeason.length) videos = ofSeason;
+                    var sel = filesForSeason(videos, curSeason);
+
+                    if (sel.wrong) {
+                        tsApi({ action: 'rem', hash: hash }, function () {}, function () {});
+                        Lampa.Noty.show('У цій роздачі лише сезон ' + sel.wrong.join(', ') + ' — шукаю далі…');
+                        if (onDead) return onDead();
+                        return;
+                    }
+
+                    videos = sel.files;
                 }
 
                 // Серіал: серії за номерами, вибір + плейлист
