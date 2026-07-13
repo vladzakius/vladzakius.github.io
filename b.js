@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 9;
+    var BQ_VERSION = 10;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -348,7 +348,10 @@
 
             waitFiles(hash, function (files) {
                 var videos = files.filter(function (f) {
-                    return /\.(mkv|mp4|avi|ts|m4v|mov)$/i.test(f.path);
+                    if (!/\.(mkv|mp4|avi|ts|m4v|mov)$/i.test(f.path)) return false;
+                    // Семпли й трейлери в паках ламають плеєр
+                    if (/\b(sample|семпл|trailer|трейлер)\b/i.test(f.path)) return false;
+                    return true;
                 });
 
                 if (!videos.length) {
@@ -357,18 +360,19 @@
                     return Lampa.Noty.show('У роздачі немає відеофайлу');
                 }
 
-                function streamOf(f) {
+                function streamOf(f, pos) {
+                    var idx = (f.id !== undefined && f.id !== null) ? f.id : (pos + 1);
                     return tsUrl() + '/stream/' +
                         encodeURIComponent(f.path.split('/').pop()) +
-                        '?link=' + hash + '&index=' + f.id + '&play';
+                        '?link=' + hash + '&index=' + idx + '&play';
                 }
 
                 // Фільм або одиночний файл — граємо одразу
                 if (!curIsSeries || videos.length === 1) {
                     var video = videos.sort(function (a, b) { return b.length - a.length; })[0];
 
-                    Lampa.Player.play({ url: streamOf(video), title: title, timeline: card.timeline, quality: false });
-                    Lampa.Player.playlist([{ url: streamOf(video), title: title }]);
+                    Lampa.Player.play({ url: streamOf(video, 0), title: title, timeline: card.timeline, quality: false });
+                    Lampa.Player.playlist([{ url: streamOf(video, 0), title: title }]);
                     return;
                 }
 
@@ -391,8 +395,8 @@
                     return a.path.localeCompare(b.path, undefined, { numeric: true, sensitivity: 'base' });
                 });
 
-                var playlist = videos.map(function (f) {
-                    return { url: streamOf(f), title: f.path.split('/').pop() };
+                var playlist = videos.map(function (f, i) {
+                    return { url: streamOf(f, i), title: f.path.split('/').pop() };
                 });
 
                 Lampa.Select.show({
