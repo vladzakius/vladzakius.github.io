@@ -5,16 +5,60 @@
     window.best_quality_plugin = true;
 
     var STORE = {
+        tv:     'bq_tv',       // панель ТБ: fhd або uhd
         res:    'bq_res',      // мінімальна бажана роздільність
         codec:  'bq_codec',    // бажаний кодек
-        hdr:    'bq_hdr',      // пріоритет HDR/DV
+        hdr:    'bq_hdr',      // HDR: prefer / ignore / avoid
         maxgb:  'bq_maxgb',    // ліміт розміру, ГБ (0 = без ліміту)
-        seeds:  'bq_seeds'     // мінімум сідів
+        seeds:  'bq_seeds',    // мінімум сідів
+        ukr:    'bq_ukr'       // бонус за українську озвучку
     };
 
     function cfg(key, def) {
         var v = Lampa.Storage.get(STORE[key], def);
         return v === '' || v === undefined ? def : v;
+    }
+
+    // Тривалість поточного фільму в хвилинах — для розрахунку бітрейту
+    var curRuntime = 0;
+
+    /* ---------- 0. Автовизначення можливостей екрана ---------- */
+
+    var panelCache = null;
+
+    function detectPanel() {
+        if (panelCache) return panelCache;
+
+        var is4k = false, hasHdr = false;
+
+        try {
+            var w = (window.screen && screen.width  || 0) * (window.devicePixelRatio || 1);
+            var h = (window.screen && screen.height || 0) * (window.devicePixelRatio || 1);
+            is4k = Math.max(w, h) >= 3000;
+        } catch (e) {}
+
+        try {
+            hasHdr = !!(window.matchMedia &&
+                (matchMedia('(dynamic-range: high)').matches ||
+                 matchMedia('(video-dynamic-range: high)').matches));
+        } catch (e) {}
+
+        panelCache = { is4k: is4k, hasHdr: hasHdr };
+        return panelCache;
+    }
+
+    // Режим панелі з урахуванням «Авто»
+    function tvMode() {
+        var v = cfg('tv', 'auto');
+        if (v === 'fhd' || v === 'uhd') return v;
+        return detectPanel().is4k ? 'uhd' : 'fhd';
+    }
+
+    // Режим HDR з урахуванням «Авто»
+    function hdrMode() {
+        var v = cfg('hdr', 'auto');
+        if (v === 'prefer' || v === 'ignore' || v === 'avoid') return v;
+        return detectPanel().hasHdr ? 'prefer' : 'avoid';
     }
 
     /* ---------- 1. Оцінка релізу ---------- */
@@ -31,30 +75,53 @@
         var isQualitySource = /remux|blu.?ray|bdrip|web.?dl|webrip/.test(t);
         if (!isQualitySource && /\b(cam|camrip|ts|telesync|tc|telecine|screener|scr|hdcam)\b/.test(t)) return -1;
 
-        // Роздільність — головний фактор
-        if (/2160|4k|uhd/.test(t))      score += 500;
-        else if (/1440/.test(t))        score += 300;
-        else if (/1080/.test(t))        score += 250;
-        else if (/720/.test(t))         score += 100;
-        else                            score += 20;
+        // Роздільність — залежить від панелі телевізора
+        var tv = tvMode();
 
-        // Джерело
-        if (/remux/.test(t))            score += 200;
-        else if (/blu.?ray|bdrip/.test(t)) score += 120;
-        else if (/web.?dl/.test(t))     score += 90;
-        else if (/webrip/.test(t))      score += 60;
-        else if (/hdtv/.test(t))        score += 30;
+        if (tv === 'fhd') {
+            // Full HD панель: 1080p — оптимум; 4K лише гріє декодер
+            if (/1080/.test(t))             score += 400;
+            else if (/1440/.test(t))        score += 200;
+            else if (/2160|4k|uhd/.test(t)) score += 120;
+            else if (/720/.test(t))         score += 100;
+            else                            score += 20;
+
+            // Remux для FHD — марна вага: штраф замість бонусу
+            if (/remux/.test(t))            score -= 150;
+            else if (/blu.?ray|bdrip/.test(t)) score += 120;
+            else if (/web.?dl/.test(t))     score += 90;
+            else if (/webrip/.test(t))      score += 60;
+            else if (/hdtv/.test(t))        score += 30;
+        }
+        else {
+            // 4K панель: класична драбина
+            if (/2160|4k|uhd/.test(t))      score += 500;
+            else if (/1440/.test(t))        score += 300;
+            else if (/1080/.test(t))        score += 250;
+            else if (/720/.test(t))         score += 100;
+            else                            score += 20;
+
+            if (/remux/.test(t))            score += 200;
+            else if (/blu.?ray|bdrip/.test(t)) score += 120;
+            else if (/web.?dl/.test(t))     score += 90;
+            else if (/webrip/.test(t))      score += 60;
+            else if (/hdtv/.test(t))        score += 30;
+        }
+
+        // Українська озвучка
+        var ukrOn = cfg('ukr', 'true');
+        if ((ukrOn === true || ukrOn === 'true') && /ukr|укр/.test(t)) score += 100;
 
         // HDR / Dolby Vision — залежить від можливостей телевізора
-        var hdrMode = cfg('hdr', 'prefer');
+        var hm = hdrMode();
         var hasDV  = /dolby.?vision|\bdv\b/.test(t);
         var hasHDR = /hdr/.test(t);
 
-        if (hdrMode === 'avoid') {
+        if (hm === 'avoid') {
             // SDR-телевізор: HDR/DV дає темну блеклу картинку — відкидаємо
             if (hasDV || hasHDR) return -1;
         }
-        else if (hdrMode === 'prefer' || hdrMode === true || hdrMode === 'true') {
+        else if (hm === 'prefer') {
             if (hasDV)                score += 120;
             if (/hdr10\+/.test(t))    score += 100;
             else if (hasHDR)          score += 80;
@@ -70,8 +137,34 @@
         if (/(truehd|atmos|dts.?hd|dts.?x)/.test(t)) score += 50;
         else if (/dts|eac3|ddp/.test(t))             score += 20;
 
-        // Бітрейт: за відсутності тривалості беремо розмір як проксі
-        score += Math.min(sizeGb * 6, 120);
+        // Бітрейт: рахуємо з розміру і тривалості фільму (Мбіт/с)
+        if (curRuntime > 0 && sizeGb > 0) {
+            var mbit = (item.Size * 8) / (curRuntime * 60) / 1e6;
+
+            if (tv === 'uhd') {
+                // 4K панель: зона комфорту ширша
+                if (mbit >= 20 && mbit <= 60)      score += 150;
+                else if (mbit >= 10 && mbit < 20)  score += 90;
+                else if (mbit > 60 && mbit <= 90)  score += 30;
+                else if (mbit > 90)                score -= 80;
+                else                               score += 20;
+            }
+            else {
+                // FHD: солодка зона 15–30 Мбіт
+                if (mbit >= 15 && mbit <= 30)      score += 150;
+                else if (mbit >= 8 && mbit < 15)   score += 90;
+                else if (mbit > 30 && mbit <= 45)  score += 20;
+                else if (mbit > 45)                score -= 100;
+                else                               score += 20;
+            }
+        }
+        else {
+            // Тривалість невідома — грубі зони за розміром
+            if (sizeGb >= 8 && sizeGb <= 25)      score += 120;
+            else if (sizeGb > 4 && sizeGb < 8)    score += 70;
+            else if (sizeGb > 25 && sizeGb <= 40) score += 40;
+            else if (sizeGb > 40)                 score -= 60;
+        }
 
         // Живучість роздачі
         score += Math.min(seeds, 100) * 1.5;
@@ -82,7 +175,7 @@
     function passesFilters(item) {
         var t = (item.Title || '').toLowerCase();
         var sizeGb = (item.Size || 0) / 1073741824;
-        var maxGb = parseFloat(cfg('maxgb', 0)) || 0;
+        var maxGb = parseFloat(cfg('maxgb', tvMode() === 'uhd' ? 80 : 30)) || 0;
         var minSeeds = parseInt(cfg('seeds', 1), 10) || 0;
         var minRes = cfg('res', '1080');
 
@@ -232,6 +325,8 @@
         var title = card.title || card.name || '';
         var original = card.original_title || card.original_name || '';
 
+        curRuntime = parseInt(card.runtime, 10) || 0;
+
         Lampa.Noty.show('Шукаю найкращий реліз…');
 
         search(title, function (list) {
@@ -304,6 +399,18 @@
 
         Lampa.SettingsApi.addParam({
             component: 'best_quality',
+            param: { name: STORE.tv, type: 'select', values: { auto: 'Авто (визначити самому)', fhd: 'Full HD (1080p)', uhd: '4K' }, default: 'auto' },
+            field: { name: 'Панель телевізора', description: 'Авто: плагін сам визначає роздільність екрана цього пристрою' }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'best_quality',
+            param: { name: STORE.ukr, type: 'trigger', default: true },
+            field: { name: 'Перевага українській озвучці' }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'best_quality',
             param: { name: STORE.res, type: 'select', values: { '2160': 'Тільки 4K', '1080': 'Від 1080p', 'any': 'Будь-яка' }, default: '1080' },
             field: { name: 'Мінімальна роздільність' }
         });
@@ -316,14 +423,14 @@
 
         Lampa.SettingsApi.addParam({
             component: 'best_quality',
-            param: { name: STORE.hdr, type: 'select', values: { prefer: 'Перевага HDR/DV', ignore: 'Не враховувати', avoid: 'Уникати (мій ТБ без HDR)' }, default: 'prefer' },
-            field: { name: 'HDR і Dolby Vision', description: 'Якщо ТБ без HDR — такі релізи виглядають темними, обери «Уникати»' }
+            param: { name: STORE.hdr, type: 'select', values: { auto: 'Авто (за можливостями ТБ)', prefer: 'Перевага HDR/DV', ignore: 'Не враховувати', avoid: 'Уникати (мій ТБ без HDR)' }, default: 'auto' },
+            field: { name: 'HDR і Dolby Vision', description: 'Авто: якщо екран не підтримує HDR, такі релізи відсіюються' }
         });
 
         Lampa.SettingsApi.addParam({
             component: 'best_quality',
-            param: { name: STORE.maxgb, type: 'input', values: '', default: '0' },
-            field: { name: 'Ліміт розміру, ГБ', description: '0 — без обмеження' }
+            param: { name: STORE.maxgb, type: 'input', values: '', default: '' },
+            field: { name: 'Ліміт розміру, ГБ', description: 'Порожньо — авто (30 для FHD, 80 для 4K), 0 — без обмеження' }
         });
 
         Lampa.SettingsApi.addParam({
