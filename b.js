@@ -23,6 +23,7 @@
     var curRuntime = 0;
     // Серіал: інша логіка розміру, вибір сезону і серії
     var curIsSeries = false;
+    var curMaxSeason = 0;
 
     /* ---------- 0. Автовизначення можливостей екрана ---------- */
 
@@ -373,6 +374,7 @@
         curRuntime = parseInt(card.runtime, 10) || 0;
         // Серіал: у картки є name/first_air_date замість title/release_date
         curIsSeries = !!(card.first_air_date || (card.name && !card.title));
+        curMaxSeason = parseInt(card.number_of_seasons, 10) || 0;
 
         Lampa.Noty.show('Шукаю найкращий реліз…');
 
@@ -428,15 +430,23 @@
             var reU2 = /(\d{1,2})[\s.\-]*(?:й|-й)?\s*сезон/g;     // 2 сезон, 2-й сезон
             while ((m = reU2.exec(t))) found[parseInt(m[1], 10)] = true;
 
-            // Діапазони: s01-s05, сезони 1-5
-            var reR = /s?(\d{1,2})\s*[-–]\s*s?(\d{1,2})/g;
-            while ((m = reR.exec(t))) {
-                var a = parseInt(m[1], 10), b = parseInt(m[2], 10);
-                if (a > 0 && b >= a && b < 60) for (var n = a; n <= b; n++) found[n] = true;
-            }
+            // Діапазони — лише явно сезонні: S01-S05 або «сезоны 1-5»
+            // (інакше «Серии: 1-9» перетворюються на фантомні сезони)
+            var reR1 = /\bs(\d{1,2})\s*[-–]\s*s?(\d{1,2})/g;
+            var reR2 = /сезон[иы]?[\s.:№]*(\d{1,2})\s*[-–]\s*(\d{1,2})/g;
+            [reR1, reR2].forEach(function (re) {
+                while ((m = re.exec(t))) {
+                    var a = parseInt(m[1], 10), b = parseInt(m[2], 10);
+                    if (a > 0 && b >= a && b < 60) for (var n = a; n <= b; n++) found[n] = true;
+                }
+            });
         });
 
-        return Object.keys(found).map(Number).filter(function (n) { return n > 0 && n < 60; }).sort(function (a, b) { return a - b; });
+        return Object.keys(found).map(Number).filter(function (n) {
+            if (n <= 0 || n >= 60) return false;
+            if (curMaxSeason > 0 && n > curMaxSeason) return false;
+            return true;
+        }).sort(function (a, b) { return a - b; });
     }
 
     // Роздачі потрібного сезону, включно з діапазонами (сезони 1-5, S01-S05)
@@ -447,8 +457,9 @@
             var re = new RegExp('\\bs0?' + season + '(?:e\\d|\\b)|сезон[\\s.:№]*0?' + season + '\\b|\\b0?' + season + '[\\s.\\-]*(?:й|-й)?\\s*сезон');
             if (re.test(t)) return true;
 
-            // Діапазон: s01-s05 / сезони 1-5
-            var m = t.match(/s?(\d{1,2})\s*[-–]\s*s?(\d{1,2})/);
+            // Діапазон — лише явно сезонний: S01-S05 чи «сезоны 1-5»
+            var m = t.match(/\bs(\d{1,2})\s*[-–]\s*s?(\d{1,2})/) ||
+                    t.match(/сезон[иы]?[\s.:№]*(\d{1,2})\s*[-–]\s*(\d{1,2})/);
             if (m) {
                 var a = parseInt(m[1], 10), b = parseInt(m[2], 10);
                 if (a <= season && season <= b && b < 60) return true;
