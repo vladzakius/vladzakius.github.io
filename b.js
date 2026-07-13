@@ -1,7 +1,11 @@
 (function () {
     'use strict';
 
-    if (window.best_quality_plugin) return;
+    var BQ_VERSION = 7;
+
+    // Нова версія має право працювати поверх старої; стара не блокує нову
+    if (window.bq_version && window.bq_version >= BQ_VERSION) return;
+    window.bq_version = BQ_VERSION;
     window.best_quality_plugin = true;
 
     var STORE = {
@@ -536,10 +540,13 @@
     function addButton(e) {
         var render = e.object.activity.render();
 
-        // Подія 'full' може спрацювати повторно — не дублюємо кнопку
-        if (render.find('.view--bq').length) return;
+        // Прибираємо кнопку старої версії плагіна, якщо вона встигла з'явитися
+        render.find('.view--bq').not('.view--bq7').remove();
 
-        var btn = $('<div class="full-start__button selector view--bq">' +
+        // Подія 'full' може спрацювати повторно — не дублюємо кнопку
+        if (render.find('.view--bq7').length) return;
+
+        var btn = $('<div class="full-start__button selector view--bq view--bq7">' +
             '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round">' +
             '<circle cx="12" cy="12" r="10"/>' +
             '<polygon points="10 8 16 12 10 16 10 8" fill="currentColor" stroke="none"/>' +
@@ -613,8 +620,12 @@
     function start() {
         addSettings();
         Lampa.Listener.follow('full', function (e) {
-            if (e.type === 'complite') addButton(e);
+            if (e.type === 'complite') {
+                // Невелика затримка: даємо старому плагіну намалювати кнопку — і замінюємо її
+                setTimeout(function () { addButton(e); }, 100);
+            }
         });
+        Lampa.Noty.show('«Дивитись» v' + BQ_VERSION + ' активний');
     }
 
     if (window.appready) start();
