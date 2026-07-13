@@ -24,6 +24,7 @@
     // Серіал: інша логіка розміру, вибір сезону і серії
     var curIsSeries = false;
     var curMaxSeason = 0;
+    var curSeason = 0;
 
     /* ---------- 0. Автовизначення можливостей екрана ---------- */
 
@@ -114,6 +115,12 @@
         // Українська озвучка
         var ukrOn = cfg('ukr', 'true');
         if ((ukrOn === true || ukrOn === 'true') && /ukr|укр/.test(t)) score += 100;
+
+        // Точний збіг обраного сезону цінніший за багатосезонний пак
+        if (curIsSeries && curSeason > 0) {
+            var reExact = new RegExp('\\bs0?' + curSeason + '(?:e\\d|\\b)|сезон[\\s.:№]*0?' + curSeason + '\\b|\\b0?' + curSeason + '[\\s.\\-]*(?:й|-й)?\\s*сезон');
+            if (reExact.test(t)) score += 80;
+        }
 
         // HDR / Dolby Vision — залежить від можливостей телевізора
         var hm = hdrMode();
@@ -328,6 +335,13 @@
                     return;
                 }
 
+                // Серіал: якщо пак багатосезонний — лишаємо файли обраного сезону
+                if (curSeason > 0) {
+                    var reEp = new RegExp('s0?' + curSeason + 'e\\d|\\b0?' + curSeason + 'x\\d{2}|season[\\s._]*0?' + curSeason + '\\b|сезон[\\s._:№]*0?' + curSeason + '\\b', 'i');
+                    var ofSeason = videos.filter(function (f) { return reEp.test(f.path); });
+                    if (ofSeason.length) videos = ofSeason;
+                }
+
                 // Серіал: серії за номерами, вибір + плейлист
                 videos.sort(function (a, b) {
                     return a.path.localeCompare(b.path, undefined, { numeric: true, sensitivity: 'base' });
@@ -393,10 +407,21 @@
     function route(list, card) {
         if (!list.length) return Lampa.Noty.show('Парсер не знайшов жодного релізу');
 
+        curSeason = 0;
+
         if (!curIsSeries) return pick(list, card);
 
         // Серіал: дізнаємось, які сезони взагалі є в роздачах
         var seasons = extractSeasons(list);
+
+        function go(season) {
+            curSeason = season;
+            var filtered = filterBySeason(list, season);
+
+            if (!filtered.length) return Lampa.Noty.show('Роздач сезону ' + season + ' не знайшлося');
+
+            pick(filtered, card);
+        }
 
         if (seasons.length > 1) {
             Lampa.Select.show({
@@ -404,12 +429,12 @@
                 items: seasons.map(function (n) { return { title: 'Сезон ' + n, season: n }; }),
                 onSelect: function (item) {
                     Lampa.Controller.toggle('content');
-                    pick(filterBySeason(list, item.season), card);
+                    go(item.season);
                 },
                 onBack: function () { Lampa.Controller.toggle('content'); }
             });
         }
-        else if (seasons.length === 1) pick(filterBySeason(list, seasons[0]), card);
+        else if (seasons.length === 1) go(seasons[0]);
         else pick(list, card);
     }
 
@@ -468,7 +493,7 @@
             return false;
         });
 
-        return out.length ? out : list;
+        return out;
     }
 
     function pick(list, card) {
