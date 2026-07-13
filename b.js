@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 8;
+    var BQ_VERSION = 9;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -540,6 +540,14 @@
         return out;
     }
 
+    // Односерійний реліз: S03E05 (без діапазону), «Серия 5»
+    function isSingleEpisode(title) {
+        var t = (title || '').toLowerCase();
+        if (/\bs\d{1,2}e\d{1,3}\b(?!\s*[-–—]\s*e?\d)/.test(t) && !/\be\d{1,3}\s*[-–—]\s*e?\d/.test(t)) return true;
+        if (/серия[\s.:№]*\d/.test(t) && !/серии/.test(t)) return true;
+        return false;
+    }
+
     function pick(list, card) {
         if (!list.length) return Lampa.Noty.show('Роздач цього сезону не знайшлося');
 
@@ -547,6 +555,13 @@
             .map(function (i) { i._score = scoreRelease(i); return i; })
             .filter(function (i) { return i._score > 0; })
             .sort(function (a, b) { return b._score - a._score; });
+
+        // Серіал: сезонні паки важливіші за односерійні релізи —
+        // інакше свіжа серія онгоінга з тисячами сідів «з'їдає» вибір серії
+        if (curIsSeries) {
+            var packs = scored.filter(function (i) { return !isSingleEpisode(i.Title); });
+            if (packs.length) scored = packs;
+        }
 
         var good = scored.filter(passesFilters);
         var candidates = good.length ? good : scored;
