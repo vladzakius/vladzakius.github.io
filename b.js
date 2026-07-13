@@ -266,7 +266,7 @@
 
             if (files.length) return done(files);
 
-            if (tries >= 20) return fail('Торрент не віддав файли за 30 с — можливо, немає сідів');
+            if (tries >= 13) return fail('Торрент не віддав файли за 20 с');
 
             if (tries === 3) Lampa.Noty.show('Отримую метадані торрента…');
 
@@ -276,11 +276,14 @@
         }, fail);
     }
 
-    function playInTorrserve(item, card) {
+    function playInTorrserve(item, card, onDead) {
         var link = item.MagnetUri || item.Link;
         var title = card.title || card.name;
 
-        if (!link) return Lampa.Noty.show('У релізу немає magnet-посилання');
+        if (!link) {
+            if (onDead) return onDead();
+            return Lampa.Noty.show('У релізу немає magnet-посилання');
+        }
 
         tsApi({
             action: 'add',
@@ -290,14 +293,22 @@
             save_to_db: true
         }, function (torrent) {
             var hash = torrent && torrent.hash;
-            if (!hash) return Lampa.Noty.show('TorrServe не повернув хеш роздачі');
+            if (!hash) {
+                if (onDead) return onDead();
+                return Lampa.Noty.show('TorrServe не повернув хеш роздачі');
+            }
 
             waitFiles(hash, function (files) {
                 var video = files.filter(function (f) {
                     return /\.(mkv|mp4|avi|ts|m4v|mov)$/i.test(f.path);
                 }).sort(function (a, b) { return b.length - a.length; })[0];
 
-                if (!video) return Lampa.Noty.show('У роздачі немає відеофайлу');
+                if (!video) {
+                    // Роздача без відео — прибираємо з TorrServe і далі
+                    tsApi({ action: 'rem', hash: hash }, function () {}, function () {});
+                    if (onDead) return onDead();
+                    return Lampa.Noty.show('У роздачі немає відеофайлу');
+                }
 
                 var stream = tsUrl() + '/stream/' +
                     encodeURIComponent(video.path.split('/').pop()) +
@@ -312,6 +323,9 @@
 
                 Lampa.Player.playlist([{ url: stream, title: title }]);
             }, function (msg) {
+                // Метадані не прийшли — видаляємо мертвий торрент і пробуємо наступний
+                tsApi({ action: 'rem', hash: hash }, function () {}, function () {});
+                if (onDead) return onDead();
                 Lampa.Noty.show(msg);
             });
         }, function (msg) {
@@ -349,20 +363,32 @@
             .sort(function (a, b) { return b._score - a._score; });
 
         var good = scored.filter(passesFilters);
-        var best = good[0];
+        var candidates = good.length ? good : scored;
 
-        // Фільтри відсікли все — беремо найкраще з наявного і кажемо про це
-        if (!best && scored.length) {
-            best = scored[0];
+        if (!good.length && scored.length) {
             Lampa.Noty.show('Під фільтри нічого не підійшло (знайдено ' + list.length + '). Беру найкраще з наявного.');
         }
 
-        if (!best) return Lampa.Noty.show('Знайдено ' + list.length + ', але всі — екранки');
+        if (!candidates.length) return Lampa.Noty.show('Знайдено ' + list.length + ', але всі — екранки');
 
+        tryCandidate(candidates, 0, card);
+    }
+
+    // Пробуємо кандидатів по черзі: мертва роздача -> наступна за рейтингом
+    function tryCandidate(candidates, idx, card) {
+        if (idx >= candidates.length || idx >= 3) {
+            return Lampa.Noty.show('Живих роздач не знайшлося — спробуй пізніше або обери вручну через Торренти');
+        }
+
+        var best = candidates[idx];
         var gb = ((best.Size || 0) / 1073741824).toFixed(1);
-        Lampa.Noty.show(best.Title + ' · ' + gb + ' ГБ · ' + (best.Seeders || 0) + ' сідів');
 
-        playInTorrserve(best, card);
+        Lampa.Noty.show((idx ? '№' + (idx + 1) + ': ' : '') + best.Title + ' · ' + gb + ' ГБ · ' + (best.Seeders || 0) + ' сідів');
+
+        playInTorrserve(best, card, function () {
+            Lampa.Noty.show('Роздача мертва, пробую наступний реліз…');
+            tryCandidate(candidates, idx + 1, card);
+        });
     }
 
     function addButton(e) {
