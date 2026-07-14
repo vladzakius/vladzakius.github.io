@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 11;
+    var BQ_VERSION = 12;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -415,6 +415,7 @@
                             url: playlist[item.index].url,
                             title: playlist[item.index].title,
                             timeline: playlist[item.index].timeline,
+                            playlist: playlist,
                             quality: false
                         });
                         Lampa.Player.playlist(playlist);
