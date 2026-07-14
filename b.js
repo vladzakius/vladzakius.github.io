@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 15;
+    var BQ_VERSION = 16;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -773,32 +773,38 @@
     function addButton(e) {
         var render = e.object.activity.render();
 
-        // Прибираємо кнопку старої версії плагіна, якщо вона встигла з'явитися
-        render.find('.view--bq').not('.view--bq7').remove();
+        function insert() {
+            // Прибираємо кнопку старої версії плагіна, якщо вона встигла з'явитися
+            render.find('.view--bq').not('.view--bq7').remove();
 
-        // Подія 'full' може спрацювати повторно — не дублюємо кнопку
-        if (render.find('.view--bq7').length) return;
+            var row = render.find('.full-start-new__buttons, .full-start__buttons').first();
+            var playBtn = row.find('.button--play').first();
 
-        var btn = $('<div class="full-start__button selector view--bq view--bq7">' +
-            '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round">' +
-            '<circle cx="12" cy="12" r="10"/>' +
-            '<polygon points="10 8 16 12 10 16 10 8" fill="currentColor" stroke="none"/>' +
-            '</svg>' +
-            '<span>Дивитись</span></div>');
+            // Кнопка вже стоїть у видимому ряду — все гаразд
+            if (row.find('.view--bq7').length) return true;
 
-        btn.on('hover:enter', function () {
-            findBest(e.data.movie);
-        });
+            var btn = $('<div class="full-start__button selector view--bq view--bq7">' +
+                '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round">' +
+                '<circle cx="12" cy="12" r="10"/>' +
+                '<polygon points="10 8 16 12 10 16 10 8" fill="currentColor" stroke="none"/>' +
+                '</svg>' +
+                '<span>Дивитись</span></div>');
 
-        // Ставимо одразу після основної кнопки «Дивитись/Смотреть» на картці
-        var playBtn = render.find('.button--play').first();
+            btn.on('hover:enter', function () {
+                findBest(e.data.movie);
+            });
 
-        if (playBtn.length) playBtn.after(btn);
-        else {
-            var anchor = render.find('.view--torrent');
-            if (anchor.length) anchor.after(btn);
-            else render.find('.full-start-new__buttons, .full-start__buttons').first().prepend(btn);
+            if (playBtn.length) { playBtn.after(btn); return true; }
+            if (row.length) { row.prepend(btn); return true; }
+
+            return false;
         }
+
+        // CUB перебудовує ряд кнопок і змітає сторонні в меню «Источник» —
+        // тому вставляємось із запізненням і повторюємо, поки не приживеться
+        [300, 900, 1800].forEach(function (delay) {
+            setTimeout(insert, delay);
+        });
     }
 
     /* ---------- 5. Налаштування ---------- */
@@ -915,10 +921,7 @@
         addSettings();
         addMenuItem();
         Lampa.Listener.follow('full', function (e) {
-            if (e.type === 'complite') {
-                // Невелика затримка: даємо старому плагіну намалювати кнопку — і замінюємо її
-                setTimeout(function () { addButton(e); }, 100);
-            }
+            if (e.type === 'complite') addButton(e);
         });
         Lampa.Noty.show('«Дивитись» v' + BQ_VERSION + ' активний');
     }
