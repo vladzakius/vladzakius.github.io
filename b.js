@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 16;
+    var BQ_VERSION = 17;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -784,9 +784,8 @@
             if (row.find('.view--bq7').length) return true;
 
             var btn = $('<div class="full-start__button selector view--bq view--bq7">' +
-                '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round">' +
-                '<circle cx="12" cy="12" r="10"/>' +
-                '<polygon points="10 8 16 12 10 16 10 8" fill="currentColor" stroke="none"/>' +
+                '<svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor" stroke="none">' +
+                '<path d="M13 2L4.5 13.5h5L9.5 22 18 10.5h-5L13 2z"/>' +
                 '</svg>' +
                 '<span>Дивитись</span></div>');
 
