@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 13;
+    var BQ_VERSION = 15;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -364,6 +364,7 @@
         keys.slice(15).forEach(function (k) { delete all[k]; });
 
         Lampa.Storage.set(STORE.cont, JSON.stringify(all));
+        Lampa.Noty.show('✓ Збережено для «Дивитись далі»');
     }
 
     function contGet(card) {
@@ -395,12 +396,13 @@
 
         var finished = false;
         var t0 = Date.now();
+        var lastPre = -1, stallAt = Date.now();
 
         // Штовхаємо TorrServe качати з цієї позиції
         var xhr = new XMLHttpRequest();
         try {
             xhr.open('GET', streamUrl + '&preload', true);
-            xhr.timeout = 30000;
+            xhr.timeout = 15000;
             xhr.onload = xhr.onerror = xhr.ontimeout = function () {};
             xhr.send();
         } catch (e) {}
@@ -414,19 +416,26 @@
 
         (function poll() {
             if (finished) return;
-            if (Date.now() - t0 > 25000) return finish();
+            // Жорстка стеля 12 с — краще легкий фриз на старті, ніж довге чекання
+            if (Date.now() - t0 > 12000) return finish();
 
             tsApi({ action: 'get', hash: hash }, function (t) {
                 var pre = t && t.preloaded_bytes, size = t && t.preload_size;
 
                 if (pre === undefined || !size) {
-                    // Стара версія TorrServe без прогресу — 4 с фори і стартуємо
-                    if (Date.now() - t0 > 4000) return finish();
+                    // TorrServe без полів прогресу — 3 с фори і стартуємо
+                    if (Date.now() - t0 > 3000) return finish();
                 }
                 else {
                     var pct = Math.min(100, Math.round(pre * 100 / size));
                     Lampa.Noty.show('Буферизація ' + pct + '%…');
-                    if (pct >= 90) return finish();
+
+                    // 50% буфера достатньо для гладкого старту
+                    if (pct >= 50) return finish();
+
+                    // Буфер не росте 5 с (мало сідів) — не мучимо людину
+                    if (pre > lastPre) { lastPre = pre; stallAt = Date.now(); }
+                    else if (Date.now() - stallAt > 5000) return finish();
                 }
 
                 setTimeout(poll, 1500);
@@ -781,10 +790,15 @@
             findBest(e.data.movie);
         });
 
-        var anchor = render.find('.view--torrent');
+        // Ставимо одразу після основної кнопки «Дивитись/Смотреть» на картці
+        var playBtn = render.find('.button--play').first();
 
-        if (anchor.length) anchor.after(btn);
-        else render.find('.full-start__buttons, .full-start-new__buttons').first().append(btn);
+        if (playBtn.length) playBtn.after(btn);
+        else {
+            var anchor = render.find('.view--torrent');
+            if (anchor.length) anchor.after(btn);
+            else render.find('.full-start-new__buttons, .full-start__buttons').first().prepend(btn);
+        }
     }
 
     /* ---------- 5. Налаштування ---------- */
@@ -871,7 +885,19 @@
         });
     }
 
-    function addMenuItem() {
+    function addMenuItem(attempt) {
+        attempt = attempt || 0;
+
+        var list = $('.menu .menu__list').eq(0);
+
+        // Меню може ще не намалюватися — пробуємо до 10 разів
+        if (!list.length) {
+            if (attempt < 10) setTimeout(function () { addMenuItem(attempt + 1); }, 500);
+            return;
+        }
+
+        if (list.find('[data-action="bq_continue"]').length) return;
+
         var icon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>';
 
         var item = $('<li class="menu__item selector" data-action="bq_continue">' +
@@ -880,7 +906,7 @@
 
         item.on('hover:enter', showContinueList);
 
-        $('.menu .menu__list').eq(0).append(item);
+        list.append(item);
     }
 
     /* ---------- Старт ---------- */
