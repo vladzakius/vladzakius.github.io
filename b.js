@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 17;
+    var BQ_VERSION = 18;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -84,6 +84,9 @@
         // в назві (щоб ".TS."-контейнер у BluRay-релізі не потрапив під роздачу).
         var isQualitySource = /remux|blu.?ray|bdrip|web.?dl|webrip/.test(t);
         if (!isQualitySource && /\b(cam|camrip|ts|telesync|tc|telecine|screener|scr|hdcam)\b/.test(t)) return -1;
+
+        // 3D-релізи: на звичайному ТБ дають подвійну картинку
+        if (/\b3d\b|half.?sbs|\bh?sbs\b|half.?ou|\bh?ou\b|side.?by.?side|over.?under|стерео\s?пар/.test(t)) return -1;
 
         // Роздільність — залежить від панелі телевізора
         var tv = tvMode();
