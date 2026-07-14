@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 12;
+    var BQ_VERSION = 13;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -15,7 +15,9 @@
         hdr:    'bq_hdr',      // HDR: prefer / ignore / avoid
         maxgb:  'bq_maxgb',    // ліміт розміру, ГБ (0 = без ліміту)
         seeds:  'bq_seeds',    // мінімум сідів
-        ukr:    'bq_ukr'       // бонус за українську озвучку
+        ukr:    'bq_ukr',      // бонус за українську озвучку
+        warm:   'bq_warm',     // буферизація перед стартом
+        cont:   'bq_continue'  // пам'ять «дивитись далі»
     };
 
     function cfg(key, def) {
@@ -116,9 +118,12 @@
             else if (/hdtv/.test(t))        score += 30;
         }
 
-        // Українська озвучка
+        // Українська озвучка; повний дубляж цінніший за закадровий
         var ukrOn = cfg('ukr', 'true');
-        if ((ukrOn === true || ukrOn === 'true') && /ukr|укр/.test(t)) score += 100;
+        if (ukrOn === true || ukrOn === 'true') {
+            if (/ukr|укр/.test(t))      score += 100;
+            if (/дубляж|\bdub\b/.test(t)) score += 60;
+        }
 
         // Точний збіг обраного сезону цінніший за багатосезонний пак
         if (curIsSeries && curSeason > 0) {
@@ -324,7 +329,112 @@
         return { files: videos, wrong: null };
     }
 
-    function playInTorrserve(item, card, onDead) {
+    /* ---------- 3а. Пам'ять «Дивитись далі» ---------- */
+
+    function contAll() {
+        var v = Lampa.Storage.get(STORE.cont, '{}');
+        if (typeof v === 'string') { try { v = JSON.parse(v); } catch (e) { v = {}; } }
+        return v || {};
+    }
+
+    function contSave(card, data) {
+        var all = contAll();
+        var id = 'c' + (card.id || (card.title || card.name));
+
+        all[id] = {
+            id: id,
+            time: Date.now(),
+            season: data.season,
+            epIndex: data.epIndex,
+            epTitle: data.epTitle,
+            link: data.link,
+            card: {
+                id: card.id,
+                title: card.title, name: card.name,
+                original_title: card.original_title, original_name: card.original_name,
+                first_air_date: card.first_air_date,
+                number_of_seasons: card.number_of_seasons,
+                poster_path: card.poster_path,
+                runtime: card.runtime
+            }
+        };
+
+        // Тримаємо не більше 15 останніх
+        var keys = Object.keys(all).sort(function (a, b) { return all[b].time - all[a].time; });
+        keys.slice(15).forEach(function (k) { delete all[k]; });
+
+        Lampa.Storage.set(STORE.cont, JSON.stringify(all));
+    }
+
+    function contGet(card) {
+        return contAll()['c' + (card.id || (card.title || card.name))] || null;
+    }
+
+    // Продовження зі збереженої роздачі; якщо вона померла — звичайний пошук
+    function resumeSaved(saved) {
+        var card = saved.card;
+
+        curIsSeries = true;
+        curSeason = saved.season || 0;
+        curMaxSeason = parseInt(card.number_of_seasons, 10) || 0;
+        curRuntime = parseInt(card.runtime, 10) || 0;
+
+        Lampa.Noty.show('Відновлюю: ' + (saved.epTitle || 'останню серію'));
+
+        playInTorrserve({ MagnetUri: saved.link, Title: '' }, card, function () {
+            Lampa.Noty.show('Збережена роздача недоступна — шукаю заново');
+            findBest(card);
+        }, { episodeIndex: saved.epIndex });
+    }
+
+    /* ---------- 3б. Буферизація перед стартом ---------- */
+
+    function warmUp(hash, streamUrl, done) {
+        var w = cfg('warm', 'true');
+        if (!(w === true || w === 'true')) return done();
+
+        var finished = false;
+        var t0 = Date.now();
+
+        // Штовхаємо TorrServe качати з цієї позиції
+        var xhr = new XMLHttpRequest();
+        try {
+            xhr.open('GET', streamUrl + '&preload', true);
+            xhr.timeout = 30000;
+            xhr.onload = xhr.onerror = xhr.ontimeout = function () {};
+            xhr.send();
+        } catch (e) {}
+
+        function finish() {
+            if (finished) return;
+            finished = true;
+            try { xhr.abort(); } catch (e) {}
+            done();
+        }
+
+        (function poll() {
+            if (finished) return;
+            if (Date.now() - t0 > 25000) return finish();
+
+            tsApi({ action: 'get', hash: hash }, function (t) {
+                var pre = t && t.preloaded_bytes, size = t && t.preload_size;
+
+                if (pre === undefined || !size) {
+                    // Стара версія TorrServe без прогресу — 4 с фори і стартуємо
+                    if (Date.now() - t0 > 4000) return finish();
+                }
+                else {
+                    var pct = Math.min(100, Math.round(pre * 100 / size));
+                    Lampa.Noty.show('Буферизація ' + pct + '%…');
+                    if (pct >= 90) return finish();
+                }
+
+                setTimeout(poll, 1500);
+            }, finish);
+        })();
+    }
+
+    function playInTorrserve(item, card, onDead, opts) {
         var link = item.MagnetUri || item.Link;
         var title = card.title || card.name;
 
@@ -375,9 +485,17 @@
                 // Фільм або одиночний файл — граємо одразу
                 if (!curIsSeries || videos.length === 1) {
                     var video = videos.sort(function (a, b) { return b.length - a.length; })[0];
+                    var mUrl = streamOf(video, 0);
 
-                    Lampa.Player.play({ url: streamOf(video, 0), title: title, timeline: timelineOf(video), quality: false });
-                    Lampa.Player.playlist([{ url: streamOf(video, 0), title: title }]);
+                    if (curIsSeries) contSave(card, {
+                        season: curSeason, epIndex: 0,
+                        epTitle: video.path.split('/').pop(), link: link
+                    });
+
+                    warmUp(hash, mUrl, function () {
+                        Lampa.Player.play({ url: mUrl, title: title, timeline: timelineOf(video), quality: false });
+                        Lampa.Player.playlist([{ url: mUrl, title: title }]);
+                    });
                     return;
                 }
 
@@ -404,6 +522,29 @@
                     return { url: streamOf(f, i), title: f.path.split('/').pop(), timeline: timelineOf(f) };
                 });
 
+                function playEpisode(idx) {
+                    idx = Math.max(0, Math.min(idx, playlist.length - 1));
+
+                    contSave(card, {
+                        season: curSeason, epIndex: idx,
+                        epTitle: playlist[idx].title, link: link
+                    });
+
+                    warmUp(hash, playlist[idx].url, function () {
+                        Lampa.Player.play({
+                            url: playlist[idx].url,
+                            title: playlist[idx].title,
+                            timeline: playlist[idx].timeline,
+                            playlist: playlist,
+                            quality: false
+                        });
+                        Lampa.Player.playlist(playlist);
+                    });
+                }
+
+                // Продовження: серія відома — стартуємо без діалогу
+                if (opts && opts.episodeIndex !== undefined) return playEpisode(opts.episodeIndex);
+
                 Lampa.Select.show({
                     title: 'Яка серія?',
                     items: videos.map(function (f, i) {
@@ -411,14 +552,7 @@
                     }),
                     onSelect: function (item) {
                         Lampa.Controller.toggle('content');
-                        Lampa.Player.play({
-                            url: playlist[item.index].url,
-                            title: playlist[item.index].title,
-                            timeline: playlist[item.index].timeline,
-                            playlist: playlist,
-                            quality: false
-                        });
-                        Lampa.Player.playlist(playlist);
+                        playEpisode(item.index);
                     },
                     onBack: function () { Lampa.Controller.toggle('content'); }
                 });
@@ -446,6 +580,29 @@
 
         Lampa.Noty.show('Шукаю найкращий реліз…');
 
+        // Знайомий серіал: пропонуємо продовжити з місця зупинки
+        var saved = curIsSeries ? contGet(card) : null;
+        if (saved && saved.link) {
+            Lampa.Select.show({
+                title: (card.title || card.name),
+                items: [
+                    { title: '▶ Продовжити: ' + (saved.epTitle || ('сезон ' + saved.season)), act: 'resume' },
+                    { title: 'Обрати інший сезон / серію / реліз', act: 'new' }
+                ],
+                onSelect: function (item) {
+                    Lampa.Controller.toggle('content');
+                    if (item.act === 'resume') resumeSaved(saved);
+                    else doSearch();
+                },
+                onBack: function () { Lampa.Controller.toggle('content'); }
+            });
+            return;
+        }
+
+        doSearch();
+
+        function doSearch() {
+
         search(title, function (list) {
             if (!list.length && original && original !== title) {
                 search(original, function (list2) { route(list2, card); },
@@ -455,6 +612,8 @@
         }, function (msg) {
             Lampa.Noty.show(msg);
         });
+
+        }
     }
 
     // Розводимо фільми та серіали
@@ -675,15 +834,60 @@
 
         Lampa.SettingsApi.addParam({
             component: 'best_quality',
+            param: { name: STORE.warm, type: 'trigger', default: true },
+            field: { name: 'Буферизація перед стартом', description: 'Чекати наповнення кешу TorrServe, щоб уникнути фризів на початку' }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'best_quality',
             param: { name: STORE.seeds, type: 'input', values: '', default: '1' },
             field: { name: 'Мінімум сідів' }
         });
+    }
+
+    /* ---------- 6. «Дивитись далі» у головному меню ---------- */
+
+    function showContinueList() {
+        var all = contAll();
+        var items = Object.keys(all)
+            .map(function (k) { return all[k]; })
+            .sort(function (a, b) { return b.time - a.time; });
+
+        if (!items.length) return Lampa.Noty.show('Поки нічого не дивився через «Дивитись»');
+
+        Lampa.Select.show({
+            title: 'Дивитись далі',
+            items: items.map(function (e) {
+                return {
+                    title: (e.card.title || e.card.name) + ' · ' + (e.epTitle || ('сезон ' + e.season)),
+                    entry: e
+                };
+            }),
+            onSelect: function (item) {
+                Lampa.Controller.toggle('content');
+                resumeSaved(item.entry);
+            },
+            onBack: function () { Lampa.Controller.toggle('content'); }
+        });
+    }
+
+    function addMenuItem() {
+        var icon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>';
+
+        var item = $('<li class="menu__item selector" data-action="bq_continue">' +
+            '<div class="menu__ico">' + icon + '</div>' +
+            '<div class="menu__text">Дивитись далі</div></li>');
+
+        item.on('hover:enter', showContinueList);
+
+        $('.menu .menu__list').eq(0).append(item);
     }
 
     /* ---------- Старт ---------- */
 
     function start() {
         addSettings();
+        addMenuItem();
         Lampa.Listener.follow('full', function (e) {
             if (e.type === 'complite') {
                 // Невелика затримка: даємо старому плагіну намалювати кнопку — і замінюємо її
