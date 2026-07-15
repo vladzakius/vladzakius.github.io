@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 19;
+    var BQ_VERSION = 20;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -31,6 +31,7 @@
     var curIsSeries = false;
     var curMaxSeason = 0;
     var curSeason = 0;
+    var curYear = 0;
 
     /* ---------- 0. Автовизначення можливостей екрана ---------- */
 
@@ -87,6 +88,18 @@
 
         // 3D-релізи: на звичайному ТБ дають подвійну картинку
         if (/\b3d\b|half.?sbs|\bh?sbs\b|half.?ou|\bh?ou\b|side.?by.?side|over.?under|стерео\s?пар/.test(t)) return -1;
+
+        // Картка — ФІЛЬМ: серіальні роздачі з тією ж назвою не пропускаємо
+        // (напр., фільм «Джентльмени» 2019 vs серіал «Джентльмени» 2024)
+        if (!curIsSeries) {
+            if (/\bs\d{1,2}(?:e\d{1,3})?\b|сезон[\s.:№]*\d|\d[\s.\-]*(?:й|-й)?\s*сезон|сери[иія][\s.:№]*\d|\b\d{1,2}x\d{2}\b|complete\s+series/.test(t)) return -1;
+
+            // Рік у назві сильно розходиться з роком фільму — це інший твір
+            if (curYear) {
+                var years = t.match(/\b(?:19|20)\d{2}\b/g);
+                if (years && !years.some(function (y) { return Math.abs(parseInt(y, 10) - curYear) <= 1; })) return -1;
+            }
+        }
 
         // Роздільність — залежить від панелі телевізора
         var tv = tvMode();
@@ -589,6 +602,7 @@
         // Серіал: у картки є name/first_air_date замість title/release_date
         curIsSeries = !!(card.first_air_date || (card.name && !card.title));
         curMaxSeason = parseInt(card.number_of_seasons, 10) || 0;
+        curYear = parseInt((card.release_date || card.first_air_date || '').slice(0, 4), 10) || 0;
 
         Lampa.Noty.show('Шукаю найкращий реліз…');
 
