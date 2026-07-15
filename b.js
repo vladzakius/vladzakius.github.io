@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 18;
+    var BQ_VERSION = 19;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -796,10 +796,20 @@
                 findBest(e.data.movie);
             });
 
-            if (playBtn.length) { playBtn.after(btn); return true; }
-            if (row.length) { row.prepend(btn); return true; }
+            if (playBtn.length) playBtn.after(btn);
+            else if (row.length) row.prepend(btn);
+            else return false;
 
-            return false;
+            // Пульт ходить по колекції контролера, зібраній до нашої вставки —
+            // реєструємо кнопку вручну, інакше фокус її перескакує
+            try {
+                var ctrl = Lampa.Controller.enabled();
+                if (ctrl && (ctrl.name === 'full' || ctrl.name === 'content')) {
+                    Lampa.Controller.collectionAppend(btn);
+                }
+            } catch (err) {}
+
+            return true;
         }
 
         // CUB перебудовує ряд кнопок і змітає сторонні в меню «Источник» —
