@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 20;
+    var BQ_VERSION = 21;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -814,14 +814,16 @@
             else if (row.length) row.prepend(btn);
             else return false;
 
-            // Пульт ходить по колекції контролера, зібраній до нашої вставки —
-            // реєструємо кнопку вручну, інакше фокус її перескакує
-            try {
-                var ctrl = Lampa.Controller.enabled();
-                if (ctrl && (ctrl.name === 'full' || ctrl.name === 'content')) {
+            // Пульт ходить по колекції контролера, зібраній ДО нашої вставки.
+            // collectionAppend у CUB не завжди чіпляє, тому найнадійніше —
+            // перезібрати контролер картки: toggle('full') збирає селектори заново.
+            setTimeout(function () {
+                try {
                     Lampa.Controller.collectionAppend(btn);
-                }
-            } catch (err) {}
+                    var c = Lampa.Controller.enabled();
+                    if (c && c.name === 'full') Lampa.Controller.toggle('full');
+                } catch (err) {}
+            }, 50);
 
             return true;
         }
