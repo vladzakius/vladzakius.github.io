@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 22;
+    var BQ_VERSION = 23;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -129,11 +129,16 @@
             else if (/hdtv/.test(t))        score += 30;
         }
 
-        // Українська озвучка; повний дубляж цінніший за закадровий
-        var ukrOn = cfg('ukr', 'true');
-        if (ukrOn === true || ukrOn === 'true') {
-            if (/ukr|укр/.test(t))      score += 100;
-            if (/дубляж|\bdub\b/.test(t)) score += 60;
+        // Пріоритет озвучки: українська → «староукраїнська» → байдуже
+        var vp = cfg('ukr', 'ukr');
+        if (vp === true || vp === 'true') vp = 'ukr';        // міграція зі старого тригера
+        if (vp === false || vp === 'false') vp = 'any';
+
+        if (vp !== 'any') {
+            if (/ukr|укр/.test(t))          score += 120;
+            if (/дубляж|\bdub\b/.test(t))   score += 40;
+            // Другий ешелон: російська озвучка краща за нічого
+            if (vp === 'ukr_rus' && /\brus\b|рус/.test(t)) score += 50;
         }
 
         // Точний збіг обраного сезону цінніший за багатосезонний пак
@@ -847,8 +852,8 @@
 
         Lampa.SettingsApi.addParam({
             component: 'best_quality',
-            param: { name: STORE.ukr, type: 'trigger', default: true },
-            field: { name: 'Перевага українській озвучці' }
+            param: { name: STORE.ukr, type: 'select', values: { ukr: 'Українська', ukr_rus: 'Українська → староукраїнська 😅', any: 'Байдуже' }, default: 'ukr' },
+            field: { name: 'Пріоритет озвучки', description: 'Впливає на вибір релізу. Доріжку всередині файлу обирає плеєр' }
         });
 
         Lampa.SettingsApi.addParam({
