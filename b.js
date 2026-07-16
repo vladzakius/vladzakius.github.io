@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 23;
+    var BQ_VERSION = 24;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -138,7 +138,7 @@
             if (/ukr|укр/.test(t))          score += 120;
             if (/дубляж|\bdub\b/.test(t))   score += 40;
             // Другий ешелон: російська озвучка краща за нічого
-            if (vp === 'ukr_rus' && /\brus\b|рус/.test(t)) score += 50;
+            if (vp === 'ukr_rus' && /\brus\b|рус/.test(t)) score += 40;
         }
 
         // Точний збіг обраного сезону цінніший за багатосезонний пак
@@ -204,6 +204,11 @@
 
         // Живучість роздачі
         score += Math.min(seeds, 100) * 1.5;
+
+        // Голодні роздачі — біль при перегляді, хай який реліз хороший.
+        // Штраф з'їдає мовний бонус: краще RUS з 50 сідами, ніж UKR із 2
+        if (seeds < 3)      score -= 150;
+        else if (seeds < 8) score -= 70;
 
         return score;
     }
