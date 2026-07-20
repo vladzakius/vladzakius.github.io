@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 25;
+    var BQ_VERSION = 26;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -146,6 +146,9 @@
         }
         else if (vp === 'rus') {
             if (hasRus) score += 120;
+            // Реліз із обома мовами: плеєр однаково може взяти українську доріжку,
+            // тож однодоріжкові RUS-роздачі мають перевагу
+            if (hasUkr) score -= 90;
         }
         // vp === 'any' — мова не впливає взагалі
 
