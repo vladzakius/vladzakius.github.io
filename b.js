@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 30;
+    var BQ_VERSION = 32;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -16,6 +16,7 @@
         maxgb:  'bq_maxgb',    // ліміт розміру, ГБ (0 = без ліміту)
         seeds:  'bq_seeds',    // мінімум сідів
         ukr:    'bq_voice',    // пріоритет озвучки (новий ключ: bq_ukr зіпсований старим тригером)
+        ext:    'bq_ext',      // пріоритет розширених/режисерських версій
         warm:   'bq_warm',     // буферизація перед стартом
         cont:   'bq_continue'  // пам'ять «дивитись далі»
     };
@@ -182,6 +183,12 @@
         if (/(hevc|h\.?265|x265)/.test(t)) score += (codec === 'hevc' ? 100 : 40);
         if (/(avc|h\.?264|x264)/.test(t))  score += (codec === 'avc'  ? 100 : 10);
 
+        // Розширені/режисерські версії — найвищий пріоритет
+        var extOn = cfg('ext', 'true');
+        if (extOn === true || extOn === 'true') {
+            if (RE_EXT.test(t)) score += 250;
+        }
+
         // Звук
         if (/(truehd|atmos|dts.?hd|dts.?x)/.test(t)) score += 50;
         else if (/dts|eac3|ddp/.test(t))             score += 20;
@@ -240,8 +247,14 @@
         if ((item.Seeders || 0) < minSeeds) return false;
         if (!curIsSeries && maxGb > 0 && sizeGb > maxGb) return false;
 
-        if (minRes === '2160' && !/2160|4k|uhd/.test(t)) return false;
-        if (minRes === '1080' && !/2160|4k|uhd|1080|1440/.test(t)) return false;
+        // Розширені версії часто існують лише в старих SD-релізах —
+        // не відсіюємо їх за роздільністю, хай користувач вирішує
+        var extOk = isExtended(t) && (function () { var v = cfg('ext', 'true'); return v === true || v === 'true'; })();
+
+        if (!extOk) {
+            if (minRes === '2160' && !/2160|4k|uhd/.test(t)) return false;
+            if (minRes === '1080' && !/2160|4k|uhd|1080|1440/.test(t)) return false;
+        }
 
         return true;
     }
@@ -773,6 +786,10 @@
         return out;
     }
 
+    // Розширена/режисерська версія
+    var RE_EXT = /extended|розширен|расширенн|director'?s?\.?\s?cut|режисерськ|режиссерск|режиссёрск|uncut|unrated|ultimate\s?(edition|cut)|final\s?cut/;
+    function isExtended(title) { return RE_EXT.test((title || '').toLowerCase()); }
+
     // Односерійний реліз: S03E05 (без діапазону), «Серия 5»
     function isSingleEpisode(title) {
         var t = (title || '').toLowerCase();
@@ -822,6 +839,34 @@
         }
 
         if (!candidates.length) return Lampa.Noty.show(rejectReason(list));
+
+        // Фільм існує і в розширеній, і в звичайній версії — даємо вибір
+        var extOn = cfg('ext', 'true');
+        if (!curIsSeries && (extOn === true || extOn === 'true')) {
+            var extList = candidates.filter(function (i) { return isExtended(i.Title); });
+            var normList = candidates.filter(function (i) { return !isExtended(i.Title); });
+
+            if (extList.length && normList.length) {
+                var info = function (arr) {
+                    var b = arr[0], t = (b.Title || '').toLowerCase();
+                    var res = /2160|4k|uhd/.test(t) ? '4K' : /1080/.test(t) ? '1080p' : /720/.test(t) ? '720p' : 'SD';
+                    return res + ' · ' + ((b.Size || 0) / 1073741824).toFixed(1) + ' ГБ · ' + (b.Seeders || 0) + ' сід';
+                };
+
+                return Lampa.Select.show({
+                    title: 'Яка версія?',
+                    items: [
+                        { title: '★ Розширена · ' + info(extList), list: extList },
+                        { title: 'Звичайна · ' + info(normList), list: normList }
+                    ],
+                    onSelect: function (item) {
+                        Lampa.Controller.toggle('content');
+                        tryCandidate(item.list, 0, card);
+                    },
+                    onBack: function () { Lampa.Controller.toggle('content'); }
+                });
+            }
+        }
 
         tryCandidate(candidates, 0, card);
     }
@@ -910,6 +955,12 @@
             component: 'best_quality',
             param: { name: STORE.ukr, type: 'select', values: { ukr: 'Українська', ukr_rus: 'Українська → староукраїнська', rus: 'Староукраїнська 😅', any: 'Байдуже' }, default: 'ukr' },
             field: { name: 'Пріоритет озвучки', description: 'Впливає лише на вибір релізу. Доріжку всередині файлу обирає плеєр' }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'best_quality',
+            param: { name: STORE.ext, type: 'trigger', default: true },
+            field: { name: 'Пріоритет розширених версій', description: 'Extended, Director\'s Cut, режисерська, Uncut, Unrated' }
         });
 
         Lampa.SettingsApi.addParam({
