@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 26;
+    var BQ_VERSION = 30;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -84,16 +84,16 @@
         // Екранки — відкидаємо одразу. Виняток: маркери якісного джерела
         // в назві (щоб ".TS."-контейнер у BluRay-релізі не потрапив під роздачу).
         var isQualitySource = /remux|blu.?ray|bdrip|web.?dl|webrip/.test(t);
-        if (!isQualitySource && /\b(cam|camrip|ts|telesync|tc|telecine|screener|scr|hdcam)\b/.test(t)) return -1;
+        if (!isQualitySource && /\b(cam|camrip|ts|telesync|tc|telecine|screener|scr|hdcam)\b/.test(t)) { item._why = 'cam'; return -1; }
 
         // 3D-релізи: на звичайному ТБ дають подвійну картинку
-        if (/\b3d\b|half.?sbs|\bh?sbs\b|half.?ou|\bh?ou\b|side.?by.?side|over.?under|стерео\s?пар/.test(t)) return -1;
+        if (/\b3d\b|half.?sbs|\bh?sbs\b|half.?ou|\bh?ou\b|side.?by.?side|over.?under|стерео\s?пар/.test(t)) { item._why = '3d'; return -1; }
 
         // Картка — ФІЛЬМ: роздачі з явними сезонними маркерами не пропускаємо
         // (напр., фільм «Джентльмени» 2019 vs серіал «Джентльмени» 2024).
         // Перевірку року прибрано: вона хибно різала колекції та перевидання.
         if (!curIsSeries) {
-            if (/\bs\d{1,2}(?:e\d{1,3})?\b|сезон[\s.:№]*\d|\d[\s.\-]*(?:й|-й)?\s*сезон|\b\d{1,2}x\d{2}\b|complete\s+series/.test(t)) return -1;
+            if (/\bs\d{1,2}(?:e\d{1,3})?\b|сезон[\s.:№]*\d|\d[\s.\-]*(?:й|-й)?\s*сезон|\b\d{1,2}x\d{2}\b|complete\s+series/.test(t)) { item._why = 'series'; return -1; }
         }
 
         // Роздільність — залежить від панелі телевізора
@@ -147,7 +147,7 @@
         else if (vp === 'rus') {
             // Реліз без жодного російського маркера, але з українським
             // (напр. «3xUkr/Eng») — російської доріжки там фізично немає
-            if (hasUkr && !hasRus) return -1;
+            if (hasUkr && !hasRus) { item._why = 'lang'; return -1; }
 
             if (hasRus) score += 120;
             // Двомовний реліз годиться, але однодоріжковий RUS кращий
@@ -164,11 +164,11 @@
         // HDR / Dolby Vision — залежить від можливостей телевізора
         var hm = hdrMode();
         var hasDV  = /dolby.?vision|\bdv\b/.test(t);
-        var hasHDR = /hdr/.test(t);
+        var hasHDR = /hdr(?!ip)/.test(t);   // HDRip — це тип джерела, а не HDR
 
         if (hm === 'avoid') {
             // SDR-телевізор: HDR/DV дає темну блеклу картинку — відкидаємо
-            if (hasDV || hasHDR) return -1;
+            if (hasDV || hasHDR) { item._why = 'hdr'; return -1; }
         }
         else if (hm === 'prefer') {
             if (hasDV)                score += 120;
@@ -207,6 +207,9 @@
                 else if (mbit > 45)                score -= 100;
                 else                               score += 20;
             }
+
+            // Фейкове HD: заявлено 1080p+, а бітрейт як у DVD — перестиснутий рип
+            if (mbit < 5 && /1080|1440|2160|4k|uhd/.test(t)) score -= 350;
         }
         else if (!curIsSeries) {
             // Тривалість невідома — грубі зони за розміром
@@ -647,17 +650,33 @@
         doSearch();
 
         function doSearch() {
+            // Шукаємо і за локалізованою, і за оригінальною назвою одразу:
+            // укр і рос релізи часто мають зовсім різні назви
+            // («Проєкт Аве Марія» vs «Проект Конец света»)
+            var queries = [title];
+            if (original && original !== title) queries.push(original);
 
-        search(title, function (list) {
-            if (!list.length && original && original !== title) {
-                search(original, function (list2) { route(list2, card); },
-                    function (m) { Lampa.Noty.show(m); });
+            var pending = queries.length, merged = [], seen = {}, failMsg = null;
+
+            function add(list) {
+                (list || []).forEach(function (i) {
+                    var key = (i.Title || '') + '|' + (i.Size || 0);
+                    if (seen[key]) return;
+                    seen[key] = true;
+                    merged.push(i);
+                });
             }
-            else route(list, card);
-        }, function (msg) {
-            Lampa.Noty.show(msg);
-        });
 
+            function done() {
+                if (--pending > 0) return;
+                if (!merged.length && failMsg) return Lampa.Noty.show(failMsg);
+                route(merged, card);
+            }
+
+            queries.forEach(function (q) {
+                search(q, function (list) { add(list); done(); },
+                          function (m) { failMsg = m; done(); });
+            });
         }
     }
 
@@ -762,6 +781,24 @@
         return false;
     }
 
+    // Чому не лишилося жодного кандидата — конкретна причина, а не здогадка
+    function rejectReason(list) {
+        var c = {};
+        list.forEach(function (i) { var w = i._why || 'other'; c[w] = (c[w] || 0) + 1; });
+
+        var top = Object.keys(c).sort(function (a, b) { return c[b] - c[a]; })[0];
+        var txt = {
+            lang:   'усі — не тією мовою (зміни «Пріоритет озвучки»)',
+            cam:    'усі — екранки',
+            hdr:    'усі — HDR/Dolby Vision (зміни налаштування HDR)',
+            '3d':   'усі — 3D',
+            series: 'усі — серіальні роздачі',
+            other:  'жоден не підійшов під фільтри'
+        }[top] || 'жоден не підійшов під фільтри';
+
+        return 'Знайдено ' + list.length + ', але ' + txt;
+    }
+
     function pick(list, card) {
         if (!list.length) return Lampa.Noty.show('Роздач цього сезону не знайшлося');
 
@@ -784,7 +821,7 @@
             Lampa.Noty.show('Під фільтри нічого не підійшло (знайдено ' + list.length + '). Беру найкраще з наявного.');
         }
 
-        if (!candidates.length) return Lampa.Noty.show('Знайдено ' + list.length + ', але всі — екранки');
+        if (!candidates.length) return Lampa.Noty.show(rejectReason(list));
 
         tryCandidate(candidates, 0, card);
     }
