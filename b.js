@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 24;
+    var BQ_VERSION = 25;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -15,7 +15,7 @@
         hdr:    'bq_hdr',      // HDR: prefer / ignore / avoid
         maxgb:  'bq_maxgb',    // ліміт розміру, ГБ (0 = без ліміту)
         seeds:  'bq_seeds',    // мінімум сідів
-        ukr:    'bq_ukr',      // бонус за українську озвучку
+        ukr:    'bq_voice',    // пріоритет озвучки (новий ключ: bq_ukr зіпсований старим тригером)
         warm:   'bq_warm',     // буферизація перед стартом
         cont:   'bq_continue'  // пам'ять «дивитись далі»
     };
@@ -129,17 +129,25 @@
             else if (/hdtv/.test(t))        score += 30;
         }
 
-        // Пріоритет озвучки: українська → «староукраїнська» → байдуже
+        // Пріоритет озвучки. 'any' — жодних мовних бонусів
         var vp = cfg('ukr', 'ukr');
-        if (vp === true || vp === 'true') vp = 'ukr';        // міграція зі старого тригера
+        if (vp === true || vp === 'true')   vp = 'ukr';   // міграція зі старого тригера
         if (vp === false || vp === 'false') vp = 'any';
 
-        if (vp !== 'any') {
-            if (/ukr|укр/.test(t))          score += 120;
-            if (/дубляж|\bdub\b/.test(t))   score += 40;
-            // Другий ешелон: російська озвучка краща за нічого
-            if (vp === 'ukr_rus' && /\brus\b|рус/.test(t)) score += 40;
+        var hasUkr = /\bukr\b|укр/.test(t);
+        var hasRus = /\brus\b|\bрус/.test(t);
+
+        if (vp === 'ukr') {
+            if (hasUkr) score += 120;
         }
+        else if (vp === 'ukr_rus') {
+            if (hasUkr) score += 120;
+            else if (hasRus) score += 40;
+        }
+        else if (vp === 'rus') {
+            if (hasRus) score += 120;
+        }
+        // vp === 'any' — мова не впливає взагалі
 
         // Точний збіг обраного сезону цінніший за багатосезонний пак
         if (curIsSeries && curSeason > 0) {
@@ -857,8 +865,8 @@
 
         Lampa.SettingsApi.addParam({
             component: 'best_quality',
-            param: { name: STORE.ukr, type: 'select', values: { ukr: 'Українська', ukr_rus: 'Українська → староукраїнська 😅', any: 'Байдуже' }, default: 'ukr' },
-            field: { name: 'Пріоритет озвучки', description: 'Впливає на вибір релізу. Доріжку всередині файлу обирає плеєр' }
+            param: { name: STORE.ukr, type: 'select', values: { ukr: 'Українська', ukr_rus: 'Українська → староукраїнська', rus: 'Староукраїнська 😅', any: 'Байдуже' }, default: 'ukr' },
+            field: { name: 'Пріоритет озвучки', description: 'Впливає лише на вибір релізу. Доріжку всередині файлу обирає плеєр' }
         });
 
         Lampa.SettingsApi.addParam({
