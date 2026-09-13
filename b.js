@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 32;
+    var BQ_VERSION = 33;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -261,6 +261,20 @@
 
     /* ---------- 2. Пошук у Jackett ---------- */
 
+    function normalizeResult(item) {
+        item = item || {};
+
+        // Jackett-сумісні парсери не завжди дотримуються регістру полів.
+        // Зводимо найпоширеніші варіанти до одного формату.
+        if (!item.Title) item.Title = item.title || item.Name || item.name || '';
+        if (item.Size === undefined) item.Size = item.size || 0;
+        if (item.Seeders === undefined) item.Seeders = item.seeders || item.Seeds || item.seeds || 0;
+        if (!item.MagnetUri) item.MagnetUri = item.magnetUri || item.magnet || '';
+        if (!item.Link) item.Link = item.link || item.DownloadUri || item.downloadUrl || '';
+
+        return item;
+    }
+
     function search(query, done, fail) {
         var url = (Lampa.Storage.get('jackett_url', '') || '').trim();
         var key = (Lampa.Storage.get('jackett_key', '') || '').trim();
@@ -280,8 +294,10 @@
         var net = new Lampa.Reguest();
 
         net.native(api, function (json) {
-            var list = (json && json.Results) || [];
-            done(list);
+            // Частина проксі повертає масив напряму або використовує lower-case.
+            var list = Array.isArray(json) ? json :
+                ((json && (json.Results || json.results || (json.data && (json.data.Results || json.data.results)))) || []);
+            done(Array.isArray(list) ? list.map(normalizeResult) : []);
         }, function () {
             fail('Парсер не відповідає');
         }, false, { dataType: 'json' });
@@ -663,17 +679,50 @@
         doSearch();
 
         function doSearch() {
-            // Шукаємо і за локалізованою, і за оригінальною назвою одразу:
-            // укр і рос релізи часто мають зовсім різні назви
-            // («Проєкт Аве Марія» vs «Проект Конец света»)
-            var queries = [title];
-            if (original && original !== title) queries.push(original);
+            // Різні індексатори по-різному обробляють апострофи, тире та рік.
+            // Тому формуємо кілька компактних варіантів, але без дублювання.
+            var queries = [], querySeen = {};
+
+            function addQuery(q) {
+                q = (q || '').replace(/\s+/g, ' ').trim();
+                if (!q) return;
+                var key = q.toLowerCase();
+                if (querySeen[key]) return;
+                querySeen[key] = true;
+                queries.push(q);
+            }
+
+            function addTitleVariants(q) {
+                if (!q) return;
+                addQuery(q);
+
+                var plain = q
+                    .replace(/[’'`]/g, ' ')
+                    .replace(/[‐‑‒–—:;,.!?()[\]{}]/g, ' ')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+
+                if (plain && plain.toLowerCase() !== q.toLowerCase()) addQuery(plain);
+                if (curYear) addQuery(plain + ' ' + curYear);
+            }
+
+            addTitleVariants(title);
+            addTitleVariants(original);
+            addTitleVariants(card.name);
+            addTitleVariants(card.original_name);
+            addTitleVariants(card.title);
+            addTitleVariants(card.original_title);
+
+            // Не перевантажуємо слабкі Jackett/JacRed інсталяції.
+            queries = queries.slice(0, 6);
 
             var pending = queries.length, merged = [], seen = {}, failMsg = null;
 
             function add(list) {
                 (list || []).forEach(function (i) {
-                    var key = (i.Title || '') + '|' + (i.Size || 0);
+                    i = normalizeResult(i);
+                    var key = i.Guid || i.InfoHash || i.MagnetUri || i.Link ||
+                        ((i.Title || '').toLowerCase() + '|' + (i.Size || 0));
                     if (seen[key]) return;
                     seen[key] = true;
                     merged.push(i);
@@ -820,8 +869,14 @@
         if (!list.length) return Lampa.Noty.show('Роздач цього сезону не знайшлося');
 
         var scored = list
-            .map(function (i) { i._score = scoreRelease(i); return i; })
-            .filter(function (i) { return i._score > 0; })
+            .map(function (i) {
+                delete i._why;
+                i._score = scoreRelease(i);
+                return i;
+            })
+            // Від'ємний бал означає «слабкий», а не обов'язково «заборонений».
+            // Жорсткі відмови scoreRelease позначає через _why.
+            .filter(function (i) { return !i._why; })
             .sort(function (a, b) { return b._score - a._score; });
 
         // Серіал: сезонні паки важливіші за односерійні релізи —
@@ -873,7 +928,7 @@
 
     // Пробуємо кандидатів по черзі: мертва роздача -> наступна за рейтингом
     function tryCandidate(candidates, idx, card) {
-        if (idx >= candidates.length || idx >= 3) {
+        if (idx >= candidates.length || idx >= 8) {
             return Lampa.Noty.show('Живих роздач не знайшлося — спробуй пізніше або обери вручну через Торренти');
         }
 
