@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 33;
+    var BQ_VERSION = 34;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -73,6 +73,42 @@
         return detectPanel().hasHdr ? 'prefer' : 'avoid';
     }
 
+    function voiceMode() {
+        var v = cfg('ukr', 'ukr');
+        if (v === true || v === 'true') return 'ukr';
+        if (v === false || v === 'false') return 'any';
+        return v;
+    }
+
+    // Назва дає лише підказку про мову, а не повний список аудіодоріжок.
+    function releaseLanguages(title) {
+        var t = String(title || '').toLowerCase();
+        return {
+            ukr: /(^|[^a-zа-яіїєґ])(?:\d+\s*x\s*)?(?:ukr|uk|ua|ukrainian)(?=$|[^a-zа-яіїєґ])|україн|украин|укр[.\s/+\],)]/.test(t),
+            rus: /(^|[^a-zа-яіїєґ])(?:\d+\s*x\s*)?(?:rus|ru|russian)(?=$|[^a-zа-яіїєґ])|русск|росій|(^|[^а-яіїєґ])рус(?=$|[^а-яіїєґ])/.test(t)
+        };
+    }
+
+    function russianTitle(card, done) {
+        var api = Lampa.Api && Lampa.Api.sources && Lampa.Api.sources.tmdb;
+        if (!api || typeof api.get !== 'function' || !card.id ||
+            (card.source && card.source !== 'tmdb')) return done('');
+        var finished = false;
+        var timer = setTimeout(function () { finish(''); }, 4500);
+        function finish(title) {
+            if (finished) return;
+            finished = true;
+            clearTimeout(timer);
+            done(typeof title === 'string' ? title : '');
+        }
+        var type = card.first_air_date || (card.name && !card.title) ? 'tv' : 'movie';
+        try {
+            api.get(type + '/' + encodeURIComponent(card.id), { langs: 'ru' },
+                function (data) { finish(data && (data.title || data.name)); },
+                function () { finish(''); });
+        } catch (e) { finish(''); }
+    }
+
     /* ---------- 1. Оцінка релізу ---------- */
 
     // Повертає бал. Чим вище — тим кращий реліз. -1 = відкинути.
@@ -135,8 +171,9 @@
         if (vp === true || vp === 'true')   vp = 'ukr';   // міграція зі старого тригера
         if (vp === false || vp === 'false') vp = 'any';
 
-        var hasUkr = /\bukr\b|укр/.test(t);
-        var hasRus = /\brus\b|\bрус/.test(t);
+        var languages = releaseLanguages(t);
+        var hasUkr = languages.ukr;
+        var hasRus = languages.rus;
 
         if (vp === 'ukr') {
             if (hasUkr) score += 120;
@@ -146,10 +183,7 @@
             else if (hasRus) score += 40;
         }
         else if (vp === 'rus') {
-            // Реліз без жодного російського маркера, але з українським
-            // (напр. «3xUkr/Eng») — російської доріжки там фізично немає
-            if (hasUkr && !hasRus) { item._why = 'lang'; return -1; }
-
+            // Невідому мову пропонуємо окремо, без автоматичної підміни.
             if (hasRus) score += 120;
             // Двомовний реліз годиться, але однодоріжковий RUS кращий
             if (hasUkr) score -= 90;
@@ -679,6 +713,10 @@
         doSearch();
 
         function doSearch() {
+            russianTitle(card, runSearch);
+        }
+
+        function runSearch(ruTitle) {
             // Різні індексатори по-різному обробляють апострофи, тире та рік.
             // Тому формуємо кілька компактних варіантів, але без дублювання.
             var queries = [], querySeen = {};
@@ -703,9 +741,14 @@
                     .trim();
 
                 if (plain && plain.toLowerCase() !== q.toLowerCase()) addQuery(plain);
-                if (curYear) addQuery(plain + ' ' + curYear);
+                if (curYear && !curIsSeries) addQuery(plain + ' ' + curYear);
             }
 
+            // Спершу всі мови: варіанти однієї назви не витісняють інші.
+            addQuery(title);
+            addQuery(original);
+            addQuery(ruTitle);
+            addTitleVariants(ruTitle);
             addTitleVariants(title);
             addTitleVariants(original);
             addTitleVariants(card.name);
@@ -735,10 +778,31 @@
                 route(merged, card);
             }
 
-            queries.forEach(function (q) {
-                search(q, function (list) { add(list); done(); },
-                          function (m) { failMsg = m; done(); });
-            });
+            if (!queries.length) return Lampa.Noty.show('У картки немає назви для пошуку');
+            // Не більше двох одночасних запитів; кожний має власний таймер.
+            var next = 0;
+            function launch() {
+                if (next >= queries.length) return;
+                var q = queries[next++], settled = false;
+                var timer = setTimeout(function () {
+                    settle([], 'Перевищено час очікування парсера');
+                }, 15000);
+                function settle(list, error) {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timer);
+                    if (error) failMsg = error;
+                    add(list);
+                    done();
+                    launch();
+                }
+                try {
+                    search(q, function (list) { settle(list); },
+                        function (error) { settle([], error); });
+                } catch (e) { settle([], 'Помилка запиту до парсера'); }
+            }
+            launch();
+            launch();
         }
     }
 
@@ -854,7 +918,6 @@
 
         var top = Object.keys(c).sort(function (a, b) { return c[b] - c[a]; })[0];
         var txt = {
-            lang:   'усі — не тією мовою (зміни «Пріоритет озвучки»)',
             cam:    'усі — екранки',
             hdr:    'усі — HDR/Dolby Vision (зміни налаштування HDR)',
             '3d':   'усі — 3D',
@@ -862,7 +925,7 @@
             other:  'жоден не підійшов під фільтри'
         }[top] || 'жоден не підійшов під фільтри';
 
-        return 'Знайдено ' + list.length + ', але ' + txt;
+        return 'Знайдено ' + list.length + '; найчастіша причина відсіву (' + c[top] + '): ' + txt.replace(/^усі — /, '');
     }
 
     function pick(list, card) {
@@ -878,6 +941,30 @@
             // Жорсткі відмови scoreRelease позначає через _why.
             .filter(function (i) { return !i._why; })
             .sort(function (a, b) { return b._score - a._score; });
+
+        // Російська: спочатку релізи з явним маркером потрібної мови.
+        // Якщо маркерів немає, пропонуємо вибір, а не запускаємо UKR автоматично.
+        if (voiceMode() === 'rus' && scored.length) {
+            var rus = scored.filter(function (i) { return releaseLanguages(i.Title).rus; });
+            if (rus.length) scored = rus;
+            else {
+                var unknown = scored.filter(function (i) { return !releaseLanguages(i.Title).ukr; });
+                if (!unknown.length) {
+                    return Lampa.Noty.show('Є ' + scored.length + ' релізів з позначкою UKR, але без RUS. Російську озвучку не підтверджено.');
+                }
+                return Lampa.Select.show({
+                    title: 'Мову не вказано — оберіть реліз для перевірки',
+                    items: unknown.slice(0, 8).map(function (i) {
+                        return { title: i.Title, release: i };
+                    }),
+                    onSelect: function (entry) {
+                        Lampa.Controller.toggle('content');
+                        tryCandidate([entry.release], 0, card);
+                    },
+                    onBack: function () { Lampa.Controller.toggle('content'); }
+                });
+            }
+        }
 
         // Серіал: сезонні паки важливіші за односерійні релізи —
         // інакше свіжа серія онгоінга з тисячами сідів «з'їдає» вибір серії
