@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 34;
+    var BQ_VERSION = 35;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -107,6 +107,142 @@
                 function (data) { finish(data && (data.title || data.name)); },
                 function () { finish(''); });
         } catch (e) { finish(''); }
+    }
+
+    /* ---------- Діагностика пристрою (без запуску відео) ---------- */
+
+    function mediaQuery(query) {
+        try {
+            var m = window.matchMedia && window.matchMedia(query);
+            if (!m || m.media === 'not all') return null;
+            return !!m.matches;
+        } catch (e) { return null; }
+    }
+
+    function browserProfile() {
+        var nav = window.navigator || {};
+        var view = window.screen || {};
+        var touch = Number(nav.maxTouchPoints || 0) > 0 || mediaQuery('(pointer: coarse)') === true;
+        var hdrHigh = mediaQuery('(dynamic-range: high)');
+        var hdrStandard = mediaQuery('(dynamic-range: standard)');
+        var video;
+        try { video = document.createElement('video'); } catch (e) {}
+        function codec(mime) {
+            try {
+                var answer = video && video.canPlayType && video.canPlayType(mime);
+                if (answer === 'probably') return 'заявлена підтримка';
+                if (answer === 'maybe') return 'можлива підтримка';
+            } catch (e) {}
+            return 'підтримку не підтверджено';
+        }
+        return {
+            touch: touch,
+            width: Number(view.width) || 0,
+            height: Number(view.height) || 0,
+            hdr: hdrHigh === true ? 'браузер повідомляє HDR' :
+                hdrStandard === true ? 'браузер повідомляє SDR' : 'невідомо',
+            avc: codec('video/mp4; codecs="avc1.42E01E"'),
+            hevc: codec('video/mp4; codecs="hvc1.1.6.L93.B0"'),
+            av1: codec('video/mp4; codecs="av01.0.05M.08"')
+        };
+    }
+
+    function installDeviceStyles() {
+        if (document.getElementById('bq-device-style')) return;
+        var style = document.createElement('style');
+        style.id = 'bq-device-style';
+        style.textContent =
+            '.view--bq{touch-action:manipulation;cursor:pointer;}' +
+            '.view--bq.focus,.view--bq:focus-visible{outline:2px solid currentColor;outline-offset:3px;}' +
+            '@media(pointer:coarse){.view--bq{min-width:44px;min-height:44px;}}' +
+            '@media(max-width:600px){.view--bq{min-width:44px;min-height:44px;}}';
+        (document.head || document.documentElement).appendChild(style);
+    }
+
+    function showDeviceInfo() {
+        var p = browserProfile();
+        Lampa.Select.show({
+            title: 'Пристрій · v' + BQ_VERSION,
+            items: [
+                { title: 'Керування: ' + (p.touch ? 'сенсорне / пульт за наявності' : 'пульт / клавіатура / миша') },
+                { title: 'Екран браузера: ' + p.width + ' × ' + p.height + ' CSS px' },
+                { title: 'HDR: ' + p.hdr },
+                { title: 'H.264: ' + p.avc },
+                { title: 'HEVC: ' + p.hevc },
+                { title: 'AV1: ' + p.av1 },
+                { title: 'Ці дані не визначають можливості зовнішнього плеєра чи фізичної панелі.' }
+            ],
+            onSelect: function () {},
+            onBack: function () { Lampa.Controller.toggle('settings_component'); }
+        });
+    }
+
+    function checkServerConnection(done) {
+        var address;
+        try { address = tsUrl(); } catch (e) { return done('Не вдалося прочитати налаштування сервера'); }
+        if (!address) return done('Адресу сервера не налаштовано в Lampa');
+        if (!/^https?:\/\/[^/\s?#]+(?:\/[^\s?#]*)?$/i.test(address) || /@/.test(address)) {
+            return done('Некоректна адреса сервера або облікові дані в адресі');
+        }
+        var finished = false;
+        var net, timer;
+        function finish(message) {
+            if (finished) return;
+            finished = true;
+            clearTimeout(timer);
+            // Прибираємо лише власний діагностичний запит.
+            try { if (net && net.clear) net.clear(); } catch (e) {}
+            done(message);
+        }
+        timer = setTimeout(function () { finish('Сервер не відповів за 8 секунд'); }, 8000);
+        try {
+            net = new Lampa.Reguest();
+            if (net.timeout) net.timeout(8000);
+            var options = { dataType: 'text' };
+            var auth = Lampa.Storage.get('torrserver_auth', false);
+            if (auth === true || auth === 'true') {
+                var login = Lampa.Storage.get('torrserver_login', '');
+                var pass = Lampa.Storage.get('torrserver_password', '');
+                options.headers = { Authorization: 'Basic ' + btoa(unescape(encodeURIComponent(login + ':' + pass))) };
+            }
+            // GET головної сторінки: не додає торрентів і не читає історію.
+            net.native(address, function () {
+                finish('HTTP-з’єднання із сервером працює. Відтворення не перевірялось.');
+            }, function (xhr, status) {
+                var code = Number(xhr && xhr.status) || 0;
+                if (code === 401) return finish('Сервер вимагає правильний логін і пароль (401)');
+                if (code === 403) return finish('Сервер відмовив у доступі (403)');
+                if (code) return finish('Сервер повернув HTTP ' + code);
+                if (status === 'timeout') return finish('Сервер не відповів за 8 секунд');
+                finish('Запит не пройшов: мережа, CORS або обмеження браузера. Точну причину браузер не повідомив.');
+            }, false, options);
+        } catch (e) { finish('Не вдалося виконати перевірку з цього пристрою'); }
+    }
+
+    function addDeviceSettings() {
+        Lampa.SettingsApi.addParam({
+            component: 'best_quality',
+            param: { name: 'bq_device_info', type: 'button' },
+            field: { name: 'Інформація про пристрій', description: 'Екран, керування та можливості браузера' },
+            onRender: function (item) { item.on('hover:enter', showDeviceInfo); }
+        });
+        var busy = false;
+        Lampa.SettingsApi.addParam({
+            component: 'best_quality',
+            param: { name: 'bq_connection_check', type: 'button' },
+            field: { name: 'Перевірити з’єднання', description: 'Перевірка налаштованого сервера без запуску відео' },
+            onRender: function (item) {
+                item.on('hover:enter', function () {
+                    if (busy) return;
+                    busy = true;
+                    Lampa.Noty.show('Перевіряю з’єднання…');
+                    checkServerConnection(function (message) {
+                        busy = false;
+                        Lampa.Noty.show(message);
+                    });
+                });
+            }
+        });
     }
 
     /* ---------- 1. Оцінка релізу ---------- */
@@ -1043,7 +1179,7 @@
             // Кнопка вже стоїть у видимому ряду — все гаразд
             if (row.find('.view--bq7').length) return true;
 
-            var btn = $('<div class="full-start__button selector view--bq view--bq7">' +
+            var btn = $('<div class="full-start__button selector view--bq view--bq7" role="button" aria-label="Дивитись">' +
                 '<svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor" stroke="none">' +
                 '<path d="M13 2L4.5 13.5h5L9.5 22 18 10.5h-5L13 2z"/>' +
                 '</svg>' +
@@ -1194,8 +1330,13 @@
 
     /* ---------- Старт ---------- */
 
+    var started = false;
     function start() {
+        if (started || window.bq_version !== BQ_VERSION) return;
+        started = true;
+        installDeviceStyles();
         addSettings();
+        addDeviceSettings();
         addMenuItem();
         Lampa.Listener.follow('full', function (e) {
             if (e.type === 'complite') addButton(e);
