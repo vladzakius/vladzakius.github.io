@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 35;
+    var BQ_VERSION = 36;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -23,7 +23,7 @@
 
     function cfg(key, def) {
         var v = Lampa.Storage.get(STORE[key], def);
-        return v === '' || v === undefined ? def : v;
+        return v === '' || v === undefined || v === null || v === 'undefined' ? def : v;
     }
 
     // Тривалість поточного фільму в хвилинах — для розрахунку бітрейту
@@ -33,6 +33,56 @@
     var curMaxSeason = 0;
     var curSeason = 0;
     var curYear = 0;
+    var operation = 0;
+
+    function isSeriesCard(card) {
+        var type = card.media_type || card.type;
+        if (type === 'movie') return false;
+        return type === 'tv' || type === 'serial' || type === 'series' ||
+            !!(card.first_air_date || card.original_name || Number(card.number_of_seasons) > 0 ||
+                (Array.isArray(card.seasons) && card.seasons.length) || (card.name && !card.title));
+    }
+
+    // Єдиний розбір сезонів для назв релізів і шляхів файлів.
+    function seasonsOfText(text) {
+        var t = String(text || '').toLowerCase().replace(/_/g, ' ');
+        var found = {}, m;
+        function add(a, b) {
+            a = Number(a); b = b === undefined ? a : Number(b);
+            if (a < 1 || b < a || b >= 100) return;
+            for (var n = a; n <= b; n++) found[n] = true;
+        }
+        [
+            /\bs(\d{1,2})\s*[-–—]\s*s?(\d{1,2})(?!\d)/g,
+            /(?:season[s]?|сезон[иы]?)[\s.:№-]*(\d{1,2})\s*[-–—]\s*(\d{1,2})(?!\d)/g,
+            /\b(\d{1,2})\s*[-–—]\s*(\d{1,2})\s*(?:season[s]?|сезон[иы]?)/g
+        ].forEach(function (re) { while ((m = re.exec(t))) add(m[1], m[2]); });
+        [
+            /\bs(\d{1,2})(?:e\d|\b)/g,
+            /\b(\d{1,2})x\d{1,3}(?!\d)/g,
+            /(?:season[s]?|сезон[иы]?)[\s.:№-]*(\d{1,2})(?!\d)/g,
+            /\b(\d{1,2})[\s.-]*(?:й\s*)?(?:season[s]?|сезон[иы]?)/g
+        ].forEach(function (re) { while ((m = re.exec(t))) add(m[1]); });
+        return Object.keys(found).map(Number).sort(function (a, b) { return a - b; });
+    }
+
+    function sizeLimit() {
+        var raw = String(cfg('maxgb', 'auto')).trim().replace(',', '.');
+        var value = Number(raw);
+        return raw !== 'auto' && raw !== '' && isFinite(value) && value >= 0 ? value :
+            (tvMode() === 'uhd' ? 80 : 30);
+    }
+
+    function codecPreference() {
+        var preference = cfg('codec', 'auto');
+        if (preference !== 'auto') return preference;
+        try {
+            var video = document.createElement('video');
+            if (video.canPlayType('video/mp4; codecs="hvc1.1.6.L93.B0"') === 'probably') return 'hevc';
+            if (video.canPlayType('video/mp4; codecs="avc1.42E01E"')) return 'avc';
+        } catch (e) {}
+        return 'any';
+    }
 
     /* ---------- 0. Автовизначення можливостей екрана ---------- */
 
@@ -70,7 +120,10 @@
     function hdrMode() {
         var v = cfg('hdr', 'auto');
         if (v === 'prefer' || v === 'ignore' || v === 'avoid') return v;
-        return detectPanel().hasHdr ? 'prefer' : 'avoid';
+        if (mediaQuery('(dynamic-range: high)') === true ||
+            mediaQuery('(video-dynamic-range: high)') === true) return 'prefer';
+        if (mediaQuery('(dynamic-range: standard)') === true) return 'avoid';
+        return 'ignore';
     }
 
     function voiceMode() {
@@ -81,8 +134,21 @@
     }
 
     // Назва дає лише підказку про мову, а не повний список аудіодоріжок.
-    function releaseLanguages(title) {
-        var t = String(title || '').toLowerCase();
+    function releaseLanguages(item) {
+        var title = typeof item === 'string' ? item : (item && item.Title) || '';
+        var t = String(title).toLowerCase();
+        // Мова субтитрів не доводить наявність відповідної аудіодоріжки.
+        t = t.replace(/(?:subtitles?|subs?|субтитр[а-яіїєґ]*|сабы)\s*[:=]\s*[^/|\]\n]+/g, ' ')
+            .replace(/(?:rus|ru|russian|ukr|uk|ua|ukrainian|русск[а-я]*|російськ[а-яі]*|українськ[а-яі]*|рус|укр)(?:\s*[+,]\s*(?:eng|rus|ukr))*[\s.-]+(?:subtitles?|subs?|субтитр[а-яіїєґ]*|сабы)(?=$|[^a-zа-яіїєґ])/g, ' ')
+            .replace(/(?:subtitles?|subs?|субтитр[а-яіїєґ]*|сабы)[\s.-]+(?:rus|ru|russian|ukr|uk|ua|ukrainian)(?![a-z])/g, ' ');
+        if (item && typeof item === 'object') {
+            function audioText(value) {
+                if (Array.isArray(value)) return value.map(audioText).join(' ');
+                if (value && typeof value === 'object') return audioText(value.language || value.lang || value.Language || '');
+                return typeof value === 'string' ? value : '';
+            }
+            t += ' ' + audioText(item.Audio || item.audio || item.audio_tracks || item.audioTracks).toLowerCase();
+        }
         return {
             ukr: /(^|[^a-zа-яіїєґ])(?:\d+\s*x\s*)?(?:ukr|uk|ua|ukrainian)(?=$|[^a-zа-яіїєґ])|україн|украин|укр[.\s/+\],)]/.test(t),
             rus: /(^|[^a-zа-яіїєґ])(?:\d+\s*x\s*)?(?:rus|ru|russian)(?=$|[^a-zа-яіїєґ])|русск|росій|(^|[^а-яіїєґ])рус(?=$|[^а-яіїєґ])/.test(t)
@@ -101,7 +167,7 @@
             clearTimeout(timer);
             done(typeof title === 'string' ? title : '');
         }
-        var type = card.first_air_date || (card.name && !card.title) ? 'tv' : 'movie';
+        var type = isSeriesCard(card) ? 'tv' : 'movie';
         try {
             api.get(type + '/' + encodeURIComponent(card.id), { langs: 'ru' },
                 function (data) { finish(data && (data.title || data.name)); },
@@ -307,7 +373,7 @@
         if (vp === true || vp === 'true')   vp = 'ukr';   // міграція зі старого тригера
         if (vp === false || vp === 'false') vp = 'any';
 
-        var languages = releaseLanguages(t);
+        var languages = releaseLanguages(item);
         var hasUkr = languages.ukr;
         var hasRus = languages.rus;
 
@@ -348,7 +414,7 @@
         }
 
         // Кодек
-        var codec = cfg('codec', 'any');
+        var codec = codecPreference();
         if (/av1/.test(t) && (codec === 'av1' || codec === 'any')) score += 60;
         if (/(hevc|h\.?265|x265)/.test(t)) score += (codec === 'hevc' ? 100 : 40);
         if (/(avc|h\.?264|x264)/.test(t))  score += (codec === 'avc'  ? 100 : 10);
@@ -410,7 +476,7 @@
     function passesFilters(item) {
         var t = (item.Title || '').toLowerCase();
         var sizeGb = (item.Size || 0) / 1073741824;
-        var maxGb = parseFloat(cfg('maxgb', tvMode() === 'uhd' ? 80 : 30)) || 0;
+        var maxGb = sizeLimit();
         var minSeeds = parseInt(cfg('seeds', 1), 10) || 0;
         var minRes = cfg('res', '1080');
 
@@ -494,7 +560,8 @@
         xhr.setRequestHeader('Content-Type', 'application/json');
         xhr.timeout = 15000;
 
-        if (Lampa.Storage.get('torrserver_auth', false)) {
+        var auth = Lampa.Storage.get('torrserver_auth', false);
+        if (auth === true || auth === 'true') {
             var login = Lampa.Storage.get('torrserver_login', '');
             var pass = Lampa.Storage.get('torrserver_password', '');
             try {
@@ -505,8 +572,10 @@
 
         xhr.onload = function () {
             if (xhr.status < 200 || xhr.status >= 300) return fail('TorrServe відповів кодом ' + xhr.status);
-            try { done(JSON.parse(xhr.responseText)); }
-            catch (e) { fail('TorrServe повернув некоректну відповідь'); }
+            var data;
+            try { data = JSON.parse(xhr.responseText); }
+            catch (e) { return fail('TorrServe повернув некоректну відповідь'); }
+            done(data);
         };
         xhr.onerror = function () { fail('Немає зв\'язку з TorrServe'); };
         xhr.ontimeout = function () { fail('TorrServe не відповідає'); };
@@ -515,36 +584,38 @@
     }
 
     // Чекаємо, поки торрент підтягне метадані і віддасть список файлів
-    function waitFiles(hash, done, fail, tries) {
-        tries = tries || 0;
-
-        tsApi({ action: 'get', hash: hash }, function (data) {
-            var files = (data && data.file_stats) || [];
-
-            if (files.length) return done(files);
-
-            if (tries >= 13) return fail('Торрент не віддав файли за 20 с');
-
-            if (tries === 3) Lampa.Noty.show('Отримую метадані торрента…');
-
-            setTimeout(function () {
-                waitFiles(hash, done, fail, tries + 1);
-            }, 1500);
-        }, fail);
+    function waitFiles(hash, done, fail) {
+        var requestId = operation, finished = false, next;
+        var deadline = setTimeout(function () { finish(null, 'Метадані не отримано за 20 с'); }, 20000);
+        function finish(files, error) {
+            if (finished) return;
+            finished = true;
+            clearTimeout(deadline); clearTimeout(next);
+            if (requestId !== operation) return;
+            if (error) fail(error); else done(files);
+        }
+        function poll() {
+            if (finished || requestId !== operation) return finish(null, 'Скасовано');
+            tsApi({ action: 'get', hash: hash }, function (data) {
+                if (finished) return;
+                var files = data && data.file_stats;
+                if (Array.isArray(files) && files.length) return finish(files);
+                next = setTimeout(poll, 1500);
+            }, function (error) { finish(null, error); });
+        }
+        poll();
     }
 
     // Які сезони реально лежать у файлах роздачі та чи є там обраний
     function filesForSeason(videos, season) {
         function seasonsOf(path) {
-            var p = path.toLowerCase();
-            var out = {}, m;
-            var re1 = /s(\d{1,2})e\d/g;
-            while ((m = re1.exec(p))) out[parseInt(m[1], 10)] = true;
-            var re2 = /\b(\d{1,2})x\d{2}\b/g;
-            while ((m = re2.exec(p))) out[parseInt(m[1], 10)] = true;
-            var re3 = /(?:season|сезон)[\s._:№-]*(\d{1,2})/g;
-            while ((m = re3.exec(p))) out[parseInt(m[1], 10)] = true;
-            return Object.keys(out).map(Number);
+            // Найближчий до файлу маркер важливіший за назву батьківської колекції.
+            var parts = String(path || '').split(/[\\/]/);
+            for (var i = parts.length - 1; i >= 0; i--) {
+                var seasons = seasonsOfText(parts[i]);
+                if (seasons.length) return seasons;
+            }
+            return [];
         }
 
         var bySeason = videos.filter(function (f) {
@@ -610,6 +681,7 @@
 
     // Продовження зі збереженої роздачі; якщо вона померла — звичайний пошук
     function resumeSaved(saved) {
+        operation++;
         var card = saved.card;
 
         curIsSeries = true;
@@ -631,9 +703,10 @@
         var w = cfg('warm', 'true');
         if (!(w === true || w === 'true')) return done();
 
-        var finished = false;
+        var finished = false, requestId = operation;
         var t0 = Date.now();
         var lastPre = -1, stallAt = Date.now();
+        var deadline = setTimeout(finish, 12000);
 
         // Штовхаємо TorrServe качати з цієї позиції
         var xhr = new XMLHttpRequest();
@@ -647,16 +720,20 @@
         function finish() {
             if (finished) return;
             finished = true;
+            clearTimeout(deadline);
             try { xhr.abort(); } catch (e) {}
-            done();
+            if (requestId === operation) done();
         }
 
         (function poll() {
             if (finished) return;
+            if (requestId !== operation) return finish();
             // Жорстка стеля 12 с — краще легкий фриз на старті, ніж довге чекання
             if (Date.now() - t0 > 12000) return finish();
 
             tsApi({ action: 'get', hash: hash }, function (t) {
+                if (finished) return;
+                if (requestId !== operation) return finish();
                 var pre = t && t.preloaded_bytes, size = t && t.preload_size;
 
                 if (pre === undefined || !size) {
@@ -681,6 +758,8 @@
     }
 
     function playInTorrserve(item, card, onDead, opts) {
+        var requestId = operation;
+        var season = curSeason, series = curIsSeries;
         var link = item.MagnetUri || item.Link;
         var title = card.title || card.name;
 
@@ -696,6 +775,7 @@
             poster: card.poster_path ? Lampa.Api.img(card.poster_path) : '',
             save_to_db: true
         }, function (torrent) {
+            if (requestId !== operation) return;
             var hash = torrent && torrent.hash;
             if (!hash) {
                 if (onDead) return onDead();
@@ -703,7 +783,12 @@
             }
 
             waitFiles(hash, function (files) {
-                var videos = files.filter(function (f) {
+                if (requestId !== operation) return;
+                // Індекс TorrServe стосується початкового списку, до фільтрації та сортування.
+                var videos = files.map(function (f, index) {
+                    return { path: String(f.path || ''), length: f.length,
+                        id: f.id !== undefined && f.id !== null ? f.id : index + 1 };
+                }).filter(function (f) {
                     if (!/\.(mkv|mp4|avi|ts|m4v|mov)$/i.test(f.path)) return false;
                     // Семпли й трейлери в паках ламають плеєр
                     if (/\b(sample|семпл|trailer|трейлер)\b/i.test(f.path)) return false;
@@ -711,7 +796,6 @@
                 });
 
                 if (!videos.length) {
-                    tsApi({ action: 'rem', hash: hash }, function () {}, function () {});
                     if (onDead) return onDead();
                     return Lampa.Noty.show('У роздачі немає відеофайлу');
                 }
@@ -728,35 +812,33 @@
                     catch (e) { return card.timeline; }
                 }
 
+                // Перевіряємо сезон і для одного відеофайлу.
+                if (series && season > 0) {
+                    var sel = filesForSeason(videos, season);
+                    if (sel.wrong) {
+                        Lampa.Noty.show('Файли не містять обраного сезону ' + season);
+                        if (onDead) onDead();
+                        return;
+                    }
+                    videos = sel.files;
+                }
+
                 // Фільм або одиночний файл — граємо одразу
-                if (!curIsSeries || videos.length === 1) {
+                if (!series || videos.length === 1) {
                     var video = videos.sort(function (a, b) { return b.length - a.length; })[0];
                     var mUrl = streamOf(video, 0);
 
-                    if (curIsSeries) contSave(card, {
-                        season: curSeason, epIndex: 0,
+                    if (series) contSave(card, {
+                        season: season, epIndex: 0,
                         epTitle: video.path.split('/').pop(), link: link
                     });
 
                     warmUp(hash, mUrl, function () {
+                        if (requestId !== operation) return;
                         Lampa.Player.play({ url: mUrl, title: title, timeline: timelineOf(video), quality: false });
                         Lampa.Player.playlist([{ url: mUrl, title: title }]);
                     });
                     return;
-                }
-
-                // Серіал: якщо пак не містить обраного сезону — це не наш пак
-                if (curSeason > 0) {
-                    var sel = filesForSeason(videos, curSeason);
-
-                    if (sel.wrong) {
-                        tsApi({ action: 'rem', hash: hash }, function () {}, function () {});
-                        Lampa.Noty.show('У цій роздачі лише сезон ' + sel.wrong.join(', ') + ' — шукаю далі…');
-                        if (onDead) return onDead();
-                        return;
-                    }
-
-                    videos = sel.files;
                 }
 
                 // Серіал: серії за номерами, вибір + плейлист
@@ -769,14 +851,16 @@
                 });
 
                 function playEpisode(idx) {
+                    if (requestId !== operation) return;
                     idx = Math.max(0, Math.min(idx, playlist.length - 1));
 
                     contSave(card, {
-                        season: curSeason, epIndex: idx,
+                        season: season, epIndex: idx,
                         epTitle: playlist[idx].title, link: link
                     });
 
                     warmUp(hash, playlist[idx].url, function () {
+                        if (requestId !== operation) return;
                         Lampa.Player.play({
                             url: playlist[idx].url,
                             title: playlist[idx].title,
@@ -803,12 +887,13 @@
                     onBack: function () { Lampa.Controller.toggle('content'); }
                 });
             }, function (msg) {
-                // Метадані не прийшли — видаляємо мертвий торрент і пробуємо наступний
-                tsApi({ action: 'rem', hash: hash }, function () {}, function () {});
+                if (requestId !== operation) return;
+                // Таймаут не доводить, що роздача мертва; вона могла вже бути у користувача.
                 if (onDead) return onDead();
                 Lampa.Noty.show(msg);
             });
         }, function (msg) {
+            if (requestId !== operation) return;
             Lampa.Noty.show(msg);
         });
     }
@@ -816,12 +901,13 @@
     /* ---------- 4. Кнопка на картці фільму ---------- */
 
     function findBest(card) {
+        var requestId = ++operation;
         var title = card.title || card.name || '';
         var original = card.original_title || card.original_name || '';
 
         curRuntime = parseInt(card.runtime, 10) || 0;
         // Серіал: у картки є name/first_air_date замість title/release_date
-        curIsSeries = !!(card.first_air_date || (card.name && !card.title));
+        curIsSeries = isSeriesCard(card);
         curMaxSeason = parseInt(card.number_of_seasons, 10) || 0;
         curYear = parseInt((card.release_date || card.first_air_date || '').slice(0, 4), 10) || 0;
 
@@ -837,6 +923,7 @@
                     { title: 'Обрати інший сезон / серію / реліз', act: 'new' }
                 ],
                 onSelect: function (item) {
+                    if (requestId !== operation) return;
                     Lampa.Controller.toggle('content');
                     if (item.act === 'resume') resumeSaved(saved);
                     else doSearch();
@@ -849,10 +936,12 @@
         doSearch();
 
         function doSearch() {
+            if (requestId !== operation) return;
             russianTitle(card, runSearch);
         }
 
         function runSearch(ruTitle) {
+            if (requestId !== operation) return;
             // Різні індексатори по-різному обробляють апострофи, тире та рік.
             // Тому формуємо кілька компактних варіантів, але без дублювання.
             var queries = [], querySeen = {};
@@ -927,6 +1016,7 @@
                     if (settled) return;
                     settled = true;
                     clearTimeout(timer);
+                    if (requestId !== operation) return;
                     if (error) failMsg = error;
                     add(list);
                     done();
@@ -944,6 +1034,7 @@
 
     // Розводимо фільми та серіали
     function route(list, card) {
+        var requestId = operation;
         if (!list.length) return Lampa.Noty.show('Парсер не знайшов жодного релізу');
 
         curSeason = 0;
@@ -954,6 +1045,7 @@
         var seasons = extractSeasons(list);
 
         function go(season) {
+            if (requestId !== operation) return;
             curSeason = season;
             var filtered = filterBySeason(list, season);
 
@@ -980,34 +1072,12 @@
     // Номери сезонів, що згадуються в назвах роздач
     function extractSeasons(list) {
         var found = {};
-
         list.forEach(function (i) {
-            var t = (i.Title || '').toLowerCase();
-            var m;
-
-            var reS = /\bs(\d{1,2})(?:e\d|\b)/g;                 // S02, S02E05
-            while ((m = reS.exec(t))) found[parseInt(m[1], 10)] = true;
-
-            var reU = /сезон[\s.:№]*(\d{1,2})/g;                  // сезон 2
-            while ((m = reU.exec(t))) found[parseInt(m[1], 10)] = true;
-
-            var reU2 = /(\d{1,2})[\s.\-]*(?:й|-й)?\s*сезон/g;     // 2 сезон, 2-й сезон
-            while ((m = reU2.exec(t))) found[parseInt(m[1], 10)] = true;
-
-            // Діапазони — лише явно сезонні: S01-S05 або «сезоны 1-5»
-            // (інакше «Серии: 1-9» перетворюються на фантомні сезони)
-            var reR1 = /\bs(\d{1,2})\s*[-–]\s*s?(\d{1,2})/g;
-            var reR2 = /сезон[иы]?[\s.:№]*(\d{1,2})\s*[-–]\s*(\d{1,2})/g;
-            [reR1, reR2].forEach(function (re) {
-                while ((m = re.exec(t))) {
-                    var a = parseInt(m[1], 10), b = parseInt(m[2], 10);
-                    if (a > 0 && b >= a && b < 60) for (var n = a; n <= b; n++) found[n] = true;
-                }
-            });
+            seasonsOfText(i.Title).forEach(function (n) { found[n] = true; });
         });
 
         return Object.keys(found).map(Number).filter(function (n) {
-            if (n <= 0 || n >= 60) return false;
+            if (n <= 0 || n >= 100) return false;
             if (curMaxSeason > 0 && n > curMaxSeason) return false;
             return true;
         }).sort(function (a, b) { return a - b; });
@@ -1015,24 +1085,9 @@
 
     // Роздачі потрібного сезону, включно з діапазонами (сезони 1-5, S01-S05)
     function filterBySeason(list, season) {
-        var out = list.filter(function (i) {
-            var t = (i.Title || '').toLowerCase();
-
-            var re = new RegExp('\\bs0?' + season + '(?:e\\d|\\b)|сезон[\\s.:№]*0?' + season + '\\b|\\b0?' + season + '[\\s.\\-]*(?:й|-й)?\\s*сезон');
-            if (re.test(t)) return true;
-
-            // Діапазон — лише явно сезонний: S01-S05 чи «сезоны 1-5»
-            var m = t.match(/\bs(\d{1,2})\s*[-–]\s*s?(\d{1,2})/) ||
-                    t.match(/сезон[иы]?[\s.:№]*(\d{1,2})\s*[-–]\s*(\d{1,2})/);
-            if (m) {
-                var a = parseInt(m[1], 10), b = parseInt(m[2], 10);
-                if (a <= season && season <= b && b < 60) return true;
-            }
-
-            return false;
+        return list.filter(function (i) {
+            return seasonsOfText(i.Title).indexOf(Number(season)) !== -1;
         });
-
-        return out;
     }
 
     // Розширена/режисерська версія
@@ -1042,6 +1097,7 @@
     // Односерійний реліз: S03E05 (без діапазону), «Серия 5»
     function isSingleEpisode(title) {
         var t = (title || '').toLowerCase();
+        if (/\b\d{1,2}x\d{1,3}\b(?!\s*[-–—]\s*\d)/.test(t)) return true;
         if (/\bs\d{1,2}e\d{1,3}\b(?!\s*[-–—]\s*e?\d)/.test(t) && !/\be\d{1,3}\s*[-–—]\s*e?\d/.test(t)) return true;
         if (/серия[\s.:№]*\d/.test(t) && !/серии/.test(t)) return true;
         return false;
@@ -1065,6 +1121,7 @@
     }
 
     function pick(list, card) {
+        var requestId = operation;
         if (!list.length) return Lampa.Noty.show('Роздач цього сезону не знайшлося');
 
         var scored = list
@@ -1081,10 +1138,10 @@
         // Російська: спочатку релізи з явним маркером потрібної мови.
         // Якщо маркерів немає, пропонуємо вибір, а не запускаємо UKR автоматично.
         if (voiceMode() === 'rus' && scored.length) {
-            var rus = scored.filter(function (i) { return releaseLanguages(i.Title).rus; });
+            var rus = scored.filter(function (i) { return releaseLanguages(i).rus; });
             if (rus.length) scored = rus;
             else {
-                var unknown = scored.filter(function (i) { return !releaseLanguages(i.Title).ukr; });
+                var unknown = scored.filter(function (i) { return !releaseLanguages(i).ukr; });
                 if (!unknown.length) {
                     return Lampa.Noty.show('Є ' + scored.length + ' релізів з позначкою UKR, але без RUS. Російську озвучку не підтверджено.');
                 }
@@ -1094,6 +1151,7 @@
                         return { title: i.Title, release: i };
                     }),
                     onSelect: function (entry) {
+                        if (requestId !== operation) return;
                         Lampa.Controller.toggle('content');
                         tryCandidate([entry.release], 0, card);
                     },
@@ -1113,7 +1171,19 @@
         var candidates = good.length ? good : scored;
 
         if (!good.length && scored.length) {
-            Lampa.Noty.show('Під фільтри нічого не підійшло (знайдено ' + list.length + '). Беру найкраще з наявного.');
+            return Lampa.Select.show({
+                title: 'Немає збігу з фільтрами — оберіть виняток',
+                items: scored.slice(0, 8).map(function (i) {
+                    return { title: i.Title + ' · ' + ((i.Size || 0) / 1073741824).toFixed(1) +
+                        ' ГБ · ' + (i.Seeders || 0) + ' сідів', release: i };
+                }),
+                onSelect: function (entry) {
+                    if (requestId !== operation) return;
+                    Lampa.Controller.toggle('content');
+                    tryCandidate([entry.release], 0, card);
+                },
+                onBack: function () { Lampa.Controller.toggle('content'); }
+            });
         }
 
         if (!candidates.length) return Lampa.Noty.show(rejectReason(list));
@@ -1138,6 +1208,7 @@
                         { title: 'Звичайна · ' + info(normList), list: normList }
                     ],
                     onSelect: function (item) {
+                        if (requestId !== operation) return;
                         Lampa.Controller.toggle('content');
                         tryCandidate(item.list, 0, card);
                     },
@@ -1152,7 +1223,7 @@
     // Пробуємо кандидатів по черзі: мертва роздача -> наступна за рейтингом
     function tryCandidate(candidates, idx, card) {
         if (idx >= candidates.length || idx >= 8) {
-            return Lampa.Noty.show('Живих роздач не знайшлося — спробуй пізніше або обери вручну через Торренти');
+            return Lampa.Noty.show('Перевірені кандидати не запустилися. Причиною можуть бути метадані, файли або з’єднання; доступність інших роздач не перевірена.');
         }
 
         var best = candidates[idx];
@@ -1161,7 +1232,7 @@
         Lampa.Noty.show((idx ? '№' + (idx + 1) + ': ' : '') + best.Title + ' · ' + gb + ' ГБ · ' + (best.Seeders || 0) + ' сідів');
 
         playInTorrserve(best, card, function () {
-            Lampa.Noty.show('Роздача мертва, пробую наступний реліз…');
+            Lampa.Noty.show('Цей кандидат не підійшов, перевіряю наступний…');
             tryCandidate(candidates, idx + 1, card);
         });
     }
@@ -1217,6 +1288,10 @@
     /* ---------- 5. Налаштування ---------- */
 
     function addSettings() {
+        var maxgb = Lampa.Storage.get(STORE.maxgb, 'auto');
+        if (maxgb === '' || maxgb === null || maxgb === undefined || maxgb === 'undefined') {
+            Lampa.Storage.set(STORE.maxgb, 'auto');
+        }
         Lampa.SettingsApi.addComponent({
             component: 'best_quality',
             name: 'Найкраща якість',
@@ -1226,7 +1301,7 @@
         Lampa.SettingsApi.addParam({
             component: 'best_quality',
             param: { name: STORE.tv, type: 'select', values: { auto: 'Авто (визначити самому)', fhd: 'Full HD (1080p)', uhd: '4K' }, default: 'auto' },
-            field: { name: 'Панель телевізора', description: 'Авто: плагін сам визначає роздільність екрана цього пристрою' }
+            field: { name: 'Екран пристрою', description: 'Авто оцінює роздільність за даними браузера. Для зовнішнього плеєра або ТБ можна обрати вручну' }
         });
 
         Lampa.SettingsApi.addParam({
@@ -1249,20 +1324,20 @@
 
         Lampa.SettingsApi.addParam({
             component: 'best_quality',
-            param: { name: STORE.codec, type: 'select', values: { any: 'Будь-який', hevc: 'HEVC / H.265', av1: 'AV1', avc: 'H.264' }, default: 'any' },
-            field: { name: 'Бажаний кодек', description: 'Врахуй, що вміє твій телевізор' }
+            param: { name: STORE.codec, type: 'select', values: { auto: 'Авто (за даними браузера)', any: 'Будь-який', hevc: 'HEVC / H.265', av1: 'AV1', avc: 'H.264' }, default: 'auto' },
+            field: { name: 'Бажаний кодек', description: 'Авто дає перевагу заявленому браузером кодеку. Для зовнішнього плеєра можна обрати вручну' }
         });
 
         Lampa.SettingsApi.addParam({
             component: 'best_quality',
             param: { name: STORE.hdr, type: 'select', values: { auto: 'Авто (за можливостями ТБ)', prefer: 'Перевага HDR/DV', ignore: 'Не враховувати', avoid: 'Уникати (мій ТБ без HDR)' }, default: 'auto' },
-            field: { name: 'HDR і Dolby Vision', description: 'Авто: якщо екран не підтримує HDR, такі релізи відсіюються' }
+            field: { name: 'HDR і Dolby Vision', description: 'Авто: враховує HDR/SDR, якщо браузер повідомляє підтримку. Якщо даних немає — не відсіює за HDR' }
         });
 
         Lampa.SettingsApi.addParam({
             component: 'best_quality',
-            param: { name: STORE.maxgb, type: 'input', values: '', default: '' },
-            field: { name: 'Ліміт розміру, ГБ', description: 'Порожньо — авто (30 для FHD, 80 для 4K), 0 — без обмеження' }
+            param: { name: STORE.maxgb, type: 'input', values: '', default: 'auto', placeholder: 'auto' },
+            field: { name: 'Ліміт розміру фільму, ГБ', description: 'auto — 30 для FHD, 80 для 4K; 0 — без обмеження. На сезонні паки не поширюється' }
         });
 
         Lampa.SettingsApi.addParam({
