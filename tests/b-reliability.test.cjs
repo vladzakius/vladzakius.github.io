@@ -27,7 +27,7 @@ function fixture() {
             Select: { show: value => { selection = value; } },
             Controller: { toggle() {} },
             Timeline: { view: key => key },
-            Player: { play: value => plays.push(value), playlist() {} },
+            Player: { play: value => plays.push(value), playlist() {}, close() {} },
             Torserver: { url: () => 'http://server.invalid' },
             Api: { img: value => value }
         }
@@ -171,11 +171,12 @@ test('new search ignores old parser responses', () => {
     searches[1].done([{ Title: 'Second S02', Link: 'https://fixture.invalid/second', Seeders: 10 }]);
     assert.equal(f.requests.length, 1); assert.equal(f.requests[0].body.title, 'Second');
 });
-test('size limit is not silently bypassed for a movie', () => {
+test('size limit fallback remains automatic and is marked relaxed', () => {
     const f = fixture(); f.storage.bq_maxgb = '1'; f.api.state(false, 0);
     f.api.pick([{ Title: 'Example 1080p', Size: 5 * 1073741824, Seeders: 50, Link: 'https://fixture.invalid/data' }], { title: 'Example' });
-    assert.equal(f.requests.length, 0);
-    assert.match(f.selection().title, /фільтрами/);
+    assert.equal(f.requests.length, 1);
+    assert.equal(f.requests[0].body.link, 'https://fixture.invalid/data');
+    assert.match(f.notices[0], /Запасний варіант/);
 });
 test('buffer deadline is independent of a stalled status request', () => {
     const f = fixture(); f.storage.bq_warm = true;
@@ -186,9 +187,53 @@ test('buffer deadline is independent of a stalled status request', () => {
     f.requests.shift().done({ preloaded_bytes: 100, preload_size: 100 });
     f.tick(30000); assert.equal(starts, 1);
 });
-test('Russian preference does not auto-select Russian subtitles as audio', () => {
+test('Russian preference treats Russian subtitles as unknown but stays automatic', () => {
     const f = fixture(); f.storage.bq_voice = 'rus'; f.api.state(true, 1);
     f.api.pick([{ Title: 'Example S01 Original + Rus Sub', Link: 'https://fixture.invalid/data', Seeders: 10 }], { title: 'Example' });
-    assert.equal(f.requests.length, 0);
-    assert.match(f.selection().title, /Мову не вказано/);
+    assert.equal(f.requests.length, 1);
+    assert.equal(f.requests[0].body.link, 'https://fixture.invalid/data');
+});
+test('language preference orders candidates but keeps automatic fallbacks', () => {
+    const f = fixture(); f.storage.bq_voice = 'rus'; f.api.state(true, 1);
+    f.api.pick([
+        { Title: 'Example S01 1080p UKR', Link: 'ukr', Seeders: 90 },
+        { Title: 'Example S01 1080p', Link: 'unknown', Seeders: 80 },
+        { Title: 'Example S01 720p RUS', Link: 'rus', Seeders: 2 }
+    ], { title: 'Example' });
+    assert.equal(f.requests[0].body.link, 'rus');
+    f.requests.shift().fail('fixture');
+    assert.equal(f.requests[0].body.link, 'unknown');
+    f.requests.shift().fail('fixture');
+    assert.equal(f.requests[0].body.link, 'ukr');
+});
+test('player receives torrent context and fatal startup error advances candidate', () => {
+    const f = fixture(); f.api.state(false, 0);
+    f.api.pick([
+        { Title: 'Example 1080p AVC', Link: 'first', Seeders: 20 },
+        { Title: 'Example 720p AVC', Link: 'second', Seeders: 10 }
+    ], { title: 'Example' });
+    f.requests.shift().done({ hash: 'one' });
+    f.requests.shift().done({ file_stats: [{ path: 'Example.mp4', id: 7 }] });
+    assert.equal(f.plays[0].torrent_hash, 'one');
+    assert.equal(f.plays[0].path, 'Example.mp4');
+    f.plays[0].error(); f.tick(250);
+    assert.equal(f.requests[0].body.link, 'second');
+});
+test('automatic retry preserves the selected episode', () => {
+    const f = fixture(); f.api.state(true, 1);
+    f.api.pick([
+        { Title: 'Example S01 1080p AVC', Link: 'first', Seeders: 20 },
+        { Title: 'Example S01 720p AVC', Link: 'second', Seeders: 10 }
+    ], { title: 'Example' });
+    f.requests.shift().done({ hash: 'one' });
+    f.requests.shift().done({ file_stats: [
+        { path: 'Example.S01E01.mp4', id: 1 }, { path: 'Example.S01E02.mp4', id: 2 }
+    ] });
+    f.selection().onSelect({ index: 1 });
+    f.plays[0].error(); f.tick(250);
+    f.requests.shift().done({ hash: 'two' });
+    f.requests.shift().done({ file_stats: [
+        { path: 'Example.S01E01.mp4', id: 1 }, { path: 'Example.S01E02.mp4', id: 2 }
+    ] });
+    assert.match(f.plays[1].url, /index=2&play/);
 });
