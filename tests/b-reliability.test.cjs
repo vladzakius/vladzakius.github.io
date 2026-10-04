@@ -237,3 +237,47 @@ test('automatic retry preserves the selected episode', () => {
     ] });
     assert.match(f.plays[1].url, /index=2&play/);
 });
+test('Ukrainian mode never falls back to Russian or unknown releases', () => {
+    const f = fixture(); f.storage.bq_voice = 'ukr'; f.api.state(false, 0);
+    f.api.pick([
+        { Title: 'Example 1080p RUS', Link: 'rus', Seeders: 100 },
+        { Title: 'Example 1080p', Link: 'unknown', Seeders: 90 },
+        { Title: 'Example 720p UKR', Link: 'ukr', Seeders: 1 }
+    ], { title: 'Example' });
+    assert.equal(f.requests.shift().body.link, 'ukr');
+    // A second isolated run rejects both non-Ukrainian candidates before server access.
+    const g = fixture(); g.storage.bq_voice = 'ukr'; g.api.state(false, 0);
+    g.api.pick([{ Title: 'Example RUS', Link: 'rus' }, { Title: 'Example', Link: 'unknown' }], { title: 'Example' });
+    assert.equal(g.requests.length, 0);
+    assert.match(g.notices[0], /українською/);
+});
+test('failed Ukrainian candidate cannot switch to a Russian fallback', () => {
+    const f = fixture(); f.storage.bq_voice = 'ukr'; f.api.state(false, 0);
+    f.api.pick([{ Title: 'Example UKR', Link: 'ukr', Seeders: 1 }, { Title: 'Example RUS', Link: 'rus', Seeders: 100 }], { title: 'Example' });
+    f.requests.shift().fail('fixture');
+    assert.equal(f.requests.length, 0);
+});
+test('explicit Russian audio metadata overrides a misleading UKR title', () => {
+    assert.deepEqual(plain(fixture().api.releaseLanguages({ Title: 'Example UKR', audio_tracks: [{ language: 'rus' }] })), { ukr: false, rus: true });
+});
+test('built-in player automatically enables Ukrainian among mixed tracks', () => {
+    const f = fixture(); f.storage.bq_voice = 'ukr'; f.api.state(false, 0);
+    let handler;
+    f.context.Lampa.PlayerVideo = { listener: { follow: (name, callback) => { handler = callback; }, remove() {} } };
+    f.api.playInTorrserve({ Title: 'Example UKR RUS', Link: 'fixture' }, { title: 'Example' }, () => assert.fail('unexpected rejection'));
+    f.requests.shift().done({ hash: 'fixture' });
+    f.requests.shift().done({ file_stats: [{ path: 'Example.mp4', id: 1 }] });
+    const tracks = [{ language: 'rus', enabled: true }, { language: 'ukr', enabled: false }];
+    handler({ tracks });
+    assert.equal(tracks[0].enabled, false); assert.equal(tracks[1].enabled, true);
+});
+test('known Russian-only player tracks trigger automatic rejection', () => {
+    const f = fixture(); f.storage.bq_voice = 'ukr'; f.api.state(false, 0);
+    let handler, rejections = 0;
+    f.context.Lampa.PlayerVideo = { listener: { follow: (name, callback) => { handler = callback; }, remove() {} } };
+    f.api.playInTorrserve({ Title: 'Example UKR', Link: 'fixture' }, { title: 'Example' }, () => rejections++);
+    f.requests.shift().done({ hash: 'fixture' });
+    f.requests.shift().done({ file_stats: [{ path: 'Example.mp4', id: 1 }] });
+    handler({ tracks: [{ language: 'rus' }] }); f.tick(250);
+    assert.equal(rejections, 1);
+});
