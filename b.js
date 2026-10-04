@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 37;
+    var BQ_VERSION = 38;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -34,6 +34,7 @@
     var curSeason = 0;
     var curYear = 0;
     var operation = 0;
+    var audioGuardCleanup = null;
 
     function isSeriesCard(card) {
         var type = card.media_type || card.type;
@@ -148,7 +149,11 @@
                 if (value && typeof value === 'object') return audioText(value.language || value.lang || value.Language || '');
                 return typeof value === 'string' ? value : '';
             }
-            t += ' ' + audioText(item.Audio || item.audio || item.audio_tracks || item.audioTracks).toLowerCase();
+            var audio = audioText(item.Audio || item.audio || item.audio_tracks || item.audioTracks).toLowerCase();
+            if (audio) {
+                var audioLanguages = releaseLanguages(audio);
+                if (audioLanguages.ukr || audioLanguages.rus) return audioLanguages;
+            }
         }
         return {
             ukr: /(^|[^a-zа-яіїєґ])(?:\d+\s*x\s*)?(?:ukr|uk|ua|ukrainian)(?=$|[^a-zа-яіїєґ])|україн|украин|укр[.\s/+\],)]/.test(t),
@@ -657,6 +662,8 @@
             epIndex: data.epIndex,
             epTitle: data.epTitle,
             link: data.link,
+            languages: data.languages,
+            releaseTitle: data.releaseTitle,
             card: {
                 id: card.id,
                 title: card.title, name: card.name,
@@ -684,6 +691,10 @@
     function resumeSaved(saved) {
         operation++;
         var card = saved.card;
+        if (voiceMode() === 'ukr' && !(saved.languages && saved.languages.ukr)) {
+            Lampa.Noty.show('Шукаю українську озвучку замість попереднього релізу');
+            return findBest(card, true);
+        }
 
         curIsSeries = true;
         curSeason = saved.season || 0;
@@ -692,9 +703,9 @@
 
         Lampa.Noty.show('Відновлюю: ' + (saved.epTitle || 'останню серію'));
 
-        playInTorrserve({ MagnetUri: saved.link, Title: '' }, card, function () {
+        playInTorrserve({ MagnetUri: saved.link, Title: saved.releaseTitle || '' }, card, function () {
             Lampa.Noty.show('Збережена роздача недоступна — шукаю заново');
-            findBest(card);
+            findBest(card, true);
         }, { episodeIndex: saved.epIndex });
     }
 
@@ -815,7 +826,7 @@
 
                 function playerData(f, url, name, list, retryOpts) {
                     var failed = false, startedAt = Date.now();
-                    return {
+                    var data = {
                         url: url,
                         title: name,
                         path: f.path,
@@ -835,6 +846,48 @@
                             }, 250);
                         }
                     };
+                    if (audioGuardCleanup) audioGuardCleanup();
+                    var videoApi = Lampa.PlayerVideo;
+                    if (voiceMode() === 'ukr' && videoApi && videoApi.listener &&
+                        videoApi.listener.follow && videoApi.listener.remove) {
+                        var listener = videoApi.listener;
+                        function cleanup() {
+                            listener.remove('tracks', chooseAudio);
+                            if (Lampa.Player.listener && Lampa.Player.listener.remove) {
+                                Lampa.Player.listener.remove('destroy', cleanup);
+                            }
+                            if (audioGuardCleanup === cleanup) audioGuardCleanup = null;
+                        }
+                        function chooseAudio(event) {
+                            if (requestId !== operation) return cleanup();
+                            var tracks = event && event.tracks || [], target = -1, known = false;
+                            for (var n = 0; n < tracks.length; n++) {
+                                var track = tracks[n];
+                                var language = String(track.language || track.lang || '').toLowerCase();
+                                if (language && language !== 'und') known = true;
+                                if (/^(uk|ukr|uk-.*)$/.test(language) ||
+                                    releaseLanguages(String(track.label || track.title || '')).ukr) target = n;
+                            }
+                            if (target >= 0) {
+                                // Та сама властивість enabled, яку використовує Lampa Video.
+                                for (var i = 0; i < tracks.length; i++) {
+                                    tracks[i].enabled = i === target;
+                                    tracks[i].selected = i === target;
+                                }
+                                cleanup();
+                            } else if (known && tracks.length) {
+                                cleanup();
+                                Lampa.Noty.show('Української аудіодоріжки у файлі немає — шукаю інший реліз');
+                                data.error();
+                            }
+                        }
+                        listener.follow('tracks', chooseAudio);
+                        if (Lampa.Player.listener && Lampa.Player.listener.follow) {
+                            Lampa.Player.listener.follow('destroy', cleanup);
+                        }
+                        audioGuardCleanup = cleanup;
+                    }
+                    return data;
                 }
 
                 // Перевіряємо сезон і для одного відеофайлу.
@@ -855,7 +908,8 @@
 
                     if (series) contSave(card, {
                         season: season, epIndex: 0,
-                        epTitle: video.path.split('/').pop(), link: link
+                        epTitle: video.path.split('/').pop(), link: link,
+                        languages: releaseLanguages(item), releaseTitle: item.Title
                     });
 
                     warmUp(hash, mUrl, function () {
@@ -885,7 +939,8 @@
 
                     contSave(card, {
                         season: season, epIndex: idx,
-                        epTitle: playlist[idx].title, link: link
+                        epTitle: playlist[idx].title, link: link,
+                        languages: releaseLanguages(item), releaseTitle: item.Title
                     });
 
                     warmUp(hash, playlist[idx].url, function () {
@@ -925,7 +980,7 @@
 
     /* ---------- 4. Кнопка на картці фільму ---------- */
 
-    function findBest(card) {
+    function findBest(card, skipSaved) {
         var requestId = ++operation;
         var title = card.title || card.name || '';
         var original = card.original_title || card.original_name || '';
@@ -939,7 +994,7 @@
         Lampa.Noty.show('Шукаю найкращий реліз…');
 
         // Знайомий серіал: пропонуємо продовжити з місця зупинки
-        var saved = curIsSeries ? contGet(card) : null;
+        var saved = curIsSeries && !skipSaved ? contGet(card) : null;
         if (saved && saved.link) {
             Lampa.Select.show({
                 title: (card.title || card.name),
@@ -1162,6 +1217,10 @@
         // Мова задає порядок автоматичної перевірки. Невідомі та запасні
         // варіанти не губимо: вони підуть після явно бажаної мови.
         var voice = voiceMode();
+        if (voice === 'ukr') {
+            scored = scored.filter(function (i) { return releaseLanguages(i).ukr; });
+            if (!scored.length) return Lampa.Noty.show('Релізів з підтвердженою українською озвучкою не знайдено. Російська автоматично не підставляється.');
+        }
         if (voice !== 'any' && scored.length) {
             var preferred = [], secondary = [], unknown = [], fallback = [];
             scored.forEach(function (i) {
@@ -1173,7 +1232,8 @@
                 if (voice === 'ukr_rus' && lang.rus) return secondary.push(i);
                 fallback.push(i);
             });
-            scored = preferred.concat(secondary, unknown, fallback);
+            // «Українська» — обов’язкова мова; запасні фільтри якості її не змінюють.
+            scored = voice === 'ukr' ? preferred : preferred.concat(secondary, unknown, fallback);
         }
 
         // Серіал: сезонні паки важливіші за односерійні релізи —
@@ -1281,7 +1341,7 @@
         Lampa.SettingsApi.addParam({
             component: 'best_quality',
             param: { name: STORE.ukr, type: 'select', values: { ukr: 'Українська', ukr_rus: 'Українська → староукраїнська', rus: 'Староукраїнська 😅', any: 'Байдуже' }, default: 'ukr' },
-            field: { name: 'Пріоритет озвучки', description: 'Впливає лише на вибір релізу. Доріжку всередині файлу обирає плеєр' }
+            field: { name: 'Пріоритет озвучки', description: 'Українська — без підміни іншою мовою; Українська → староукраїнська — дозволяє російський запасний варіант. Вбудований плеєр автоматично обирає доступну українську доріжку; зовнішній керує доріжками сам' }
         });
 
         Lampa.SettingsApi.addParam({
