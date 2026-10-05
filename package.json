@@ -1,0 +1,15 @@
+{
+  "name": "lampa-divytys-plugin",
+  "version": "39.0.0",
+  "private": true,
+  "description": "Regression checks for the standalone b.js Lampa plugin",
+  "scripts": {
+    "test": "node --test tests/*.test.cjs",
+    "test:core": "node --test tests/b-reliability.test.cjs"
+  },
+  "devDependencies": {
+    "acorn": "8.18.0",
+    "jquery": "3.7.1",
+    "jsdom": "26.1.0"
+  }
+}

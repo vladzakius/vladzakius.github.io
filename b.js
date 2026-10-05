@@ -1,10 +1,11 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 38;
+    var BQ_VERSION = 39;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
+    if (typeof window.bq_dispose === 'function') window.bq_dispose();
     window.bq_version = BQ_VERSION;
     window.best_quality_plugin = true;
 
@@ -35,8 +36,40 @@
     var curYear = 0;
     var operation = 0;
     var audioGuardCleanup = null;
+    var requestsToCancel = [];
+    var lastReport = { status: 'Ще не запускали пошук', found: 0, candidates: 0, tried: 0, reasons: {} };
+
+    function current(id) { return id === operation && window.bq_version === BQ_VERSION; }
+    function beginOperation() {
+        operation++;
+        if (audioGuardCleanup) audioGuardCleanup();
+        var pending = requestsToCancel;
+        requestsToCancel = [];
+        pending.forEach(function (cancel) { try { cancel(); } catch (e) {} });
+        return operation;
+    }
+    function trackRequest(cancel) {
+        requestsToCancel.push(cancel);
+        return function () {
+            var i = requestsToCancel.indexOf(cancel);
+            if (i >= 0) requestsToCancel.splice(i, 1);
+        };
+    }
+    function report(message, reason) {
+        lastReport.status = message;
+        if (reason) lastReport.reasons[reason] = (lastReport.reasons[reason] || 0) + 1;
+        Lampa.Noty.show(message);
+    }
+    window.bq_dispose = function () {
+        beginOperation();
+        if (Lampa.Listener.remove) {
+            Lampa.Listener.remove('full', onFull);
+            Lampa.Listener.remove('app', onApp);
+        }
+    };
 
     function isSeriesCard(card) {
+        card = card || {};
         var type = card.media_type || card.type;
         if (type === 'movie') return false;
         return type === 'tv' || type === 'serial' || type === 'series' ||
@@ -96,15 +129,15 @@
         var is4k = false, hasHdr = false;
 
         try {
-            var w = (window.screen && screen.width  || 0) * (window.devicePixelRatio || 1);
-            var h = (window.screen && screen.height || 0) * (window.devicePixelRatio || 1);
+            var w = (window.screen && window.screen.width  || 0) * (window.devicePixelRatio || 1);
+            var h = (window.screen && window.screen.height || 0) * (window.devicePixelRatio || 1);
             is4k = Math.max(w, h) >= 3000;
         } catch (e) {}
 
         try {
             hasHdr = !!(window.matchMedia &&
-                (matchMedia('(dynamic-range: high)').matches ||
-                 matchMedia('(video-dynamic-range: high)').matches));
+                (window.matchMedia('(dynamic-range: high)').matches ||
+                 window.matchMedia('(video-dynamic-range: high)').matches));
         } catch (e) {}
 
         panelCache = { is4k: is4k, hasHdr: hasHdr };
@@ -132,7 +165,29 @@
         var v = cfg('ukr', 'ukr');
         if (v === true || v === 'true') return 'ukr';
         if (v === false || v === 'false') return 'any';
-        return v;
+        return ['ukr', 'ukr_rus', 'rus', 'any'].indexOf(v) >= 0 ? v : 'ukr';
+    }
+
+    function trackLanguage(track) {
+        track = track || {};
+        var tags = track.tags || {};
+        var code = String(track.language || track.lang || track.Language || tags.language || tags.LANGUAGE || '').toLowerCase().trim();
+        if (/^(uk|ukr|ua|uk[-_].*|ukrainian|українська|украинский)$/.test(code)) return 'ukr';
+        if (/^(ru|rus|ru[-_].*|russian|русский|російська)$/.test(code)) return 'rus';
+        // Explicit ENG/PL/etc must win over a misleading description containing UKR.
+        if (code && !/^(und|unknown|mul|zxx)$/.test(code)) return 'other';
+        var hint = releaseLanguages(String(track.label || track.title || tags.title || tags.TITLE || ''));
+        return hint.ukr ? 'ukr' : hint.rus ? 'rus' : '';
+    }
+
+    function audioMetadata(item) {
+        if (!item || typeof item !== 'object') return [];
+        var probe = item.ffprobe;
+        if (probe && !Array.isArray(probe)) probe = probe.streams;
+        var audio = Array.isArray(probe) ? probe.filter(function (s) { return s && s.codec_type === 'audio'; }) : [];
+        if (audio.length) return audio;
+        audio = item.Audio || item.audio || item.audio_tracks || item.audioTracks;
+        return Array.isArray(audio) ? audio : audio ? [audio] : [];
     }
 
     // Назва дає лише підказку про мову, а не повний список аудіодоріжок.
@@ -144,15 +199,26 @@
             .replace(/(?:rus|ru|russian|ukr|uk|ua|ukrainian|русск[а-я]*|російськ[а-яі]*|українськ[а-яі]*|рус|укр)(?:\s*[+,]\s*(?:eng|rus|ukr))*[\s.-]+(?:subtitles?|subs?|субтитр[а-яіїєґ]*|сабы)(?=$|[^a-zа-яіїєґ])/g, ' ')
             .replace(/(?:subtitles?|subs?|субтитр[а-яіїєґ]*|сабы)[\s.-]+(?:rus|ru|russian|ukr|uk|ua|ukrainian)(?![a-z])/g, ' ');
         if (item && typeof item === 'object') {
-            function audioText(value) {
-                if (Array.isArray(value)) return value.map(audioText).join(' ');
-                if (value && typeof value === 'object') return audioText(value.language || value.lang || value.Language || '');
-                return typeof value === 'string' ? value : '';
-            }
-            var audio = audioText(item.Audio || item.audio || item.audio_tracks || item.audioTracks).toLowerCase();
-            if (audio) {
-                var audioLanguages = releaseLanguages(audio);
-                if (audioLanguages.ukr || audioLanguages.rus) return audioLanguages;
+            var audio = audioMetadata(item), known = false;
+            var audioLanguages = { ukr: false, rus: false };
+            audio.forEach(function (track) {
+                if (typeof track === 'string') {
+                    var hints = releaseLanguages(track);
+                    if (hints.ukr || hints.rus) {
+                        known = true;
+                        audioLanguages.ukr = audioLanguages.ukr || hints.ukr;
+                        audioLanguages.rus = audioLanguages.rus || hints.rus;
+                        return;
+                    }
+                }
+                var lang = trackLanguage(typeof track === 'string' ? { language: track } : track);
+                if (lang) known = true;
+                if (lang === 'ukr') audioLanguages.ukr = true;
+                if (lang === 'rus') audioLanguages.rus = true;
+            });
+            if (known) return audioLanguages;
+            if (Array.isArray(item.info && item.info.voices)) {
+                t += ' ' + item.info.voices.join(' ').toLowerCase();
             }
         }
         return {
@@ -161,21 +227,23 @@
         };
     }
 
-    function russianTitle(card, done) {
+    function localizedTitle(card, language, done) {
         var api = Lampa.Api && Lampa.Api.sources && Lampa.Api.sources.tmdb;
         if (!api || typeof api.get !== 'function' || !card.id ||
             (card.source && card.source !== 'tmdb')) return done('');
         var finished = false;
         var timer = setTimeout(function () { finish(''); }, 4500);
+        var untrack = trackRequest(function () { finished = true; clearTimeout(timer); });
         function finish(title) {
             if (finished) return;
             finished = true;
             clearTimeout(timer);
+            untrack();
             done(typeof title === 'string' ? title : '');
         }
         var type = isSeriesCard(card) ? 'tv' : 'movie';
         try {
-            api.get(type + '/' + encodeURIComponent(card.id), { langs: 'ru' },
+            api.get(type + '/' + encodeURIComponent(card.id), { langs: language },
                 function (data) { finish(data && (data.title || data.name)); },
                 function () { finish(''); });
         } catch (e) { finish(''); }
@@ -319,9 +387,53 @@
 
     /* ---------- 1. Оцінка релізу ---------- */
 
+    function mediaText(item) {
+        var text = String(item.Title || '').toLowerCase();
+        var general = item.general || {};
+        text += ' ' + String(general.resolution || (item.info && item.info.quality) || '').toLowerCase();
+        if (general.hdr) text += ' hdr';
+        var probe = item.ffprobe;
+        if (probe && !Array.isArray(probe)) probe = probe.streams;
+        (Array.isArray(probe) ? probe : []).forEach(function (s) {
+            if (!s || s.codec_type !== 'video') return;
+            text += ' ' + (s.codec_name || '');
+            // Cropped widescreen video still has its original horizontal resolution.
+            var width = Number(s.width) || 0;
+            if (width >= 3800) text += ' 2160p';
+            else if (width >= 1900) text += ' 1080p';
+            else if (width >= 1260) text += ' 720p';
+            if (/smpte2084|arib-std-b67/.test(s.color_transfer || '')) text += ' hdr';
+            if (/10|12/.test(s.pix_fmt || '')) text += ' 10bit';
+        });
+        return text;
+    }
+
+    // Compatibility is a separate tier: a large bitrate cannot outweigh a safer codec.
+    function compatibilityRank(item) {
+        var t = mediaText(item), pref = codecPreference();
+        var kind = /\bav1\b/.test(t) ? 'av1' : /hevc|h[ .]?265|x265/.test(t) ? 'hevc' :
+            /avc|h[ .]?264|x264/.test(t) ? 'avc' : '';
+        var rank = !kind ? 1 : pref === 'any' || kind === pref ? 0 : 2;
+        if (cfg('codec', 'auto') === 'auto') {
+            if (kind === 'avc' && /10[ .-]?bit|hi10p/.test(t)) rank = 3;
+            var tracks = audioMetadata(item);
+            // Do not reward cinema audio when the browser cannot decode it.
+            var supported = tracks.some(function (s) {
+                var c = s && s.codec_name;
+                if (/^(aac|mp3|opus|vorbis)$/.test(c || '')) return true;
+                try {
+                    return !!document.createElement('video').canPlayType('audio/mp4; codecs="' +
+                        (c === 'eac3' ? 'ec-3' : c === 'ac3' ? 'ac-3' : c || 'unknown') + '"');
+                } catch (e) { return false; }
+            });
+            if (tracks.length && !supported && tracks.every(function (s) { return s && s.codec_name; })) rank += 1;
+        }
+        return rank;
+    }
+
     // Повертає бал. Чим вище — тим кращий реліз. -1 = відкинути.
     function scoreRelease(item) {
-        var t = (item.Title || '').toLowerCase();
+        var t = mediaText(item);
         var sizeGb = (item.Size || 0) / 1073741824;
         var seeds = item.Seeders || 0;
         var score = 0;
@@ -391,7 +503,7 @@
             else if (hasRus) score += 40;
         }
         else if (vp === 'rus') {
-            // Невідому мову пропонуємо окремо, без автоматичної підміни.
+            // Спершу російська, потім автоматичні запасні варіанти.
             if (hasRus) score += 120;
             // Двомовний реліз годиться, але однодоріжковий RUS кращий
             if (hasUkr) score -= 90;
@@ -431,10 +543,6 @@
             if (RE_EXT.test(t)) score += 250;
         }
 
-        // Звук
-        if (/(truehd|atmos|dts.?hd|dts.?x)/.test(t)) score += 50;
-        else if (/dts|eac3|ddp/.test(t))             score += 20;
-
         // Бітрейт: рахуємо з розміру і тривалості фільму (Мбіт/с)
         // Для серіалів пропускаємо: сезонний пак великий за визначенням
         if (!curIsSeries && curRuntime > 0 && sizeGb > 0) {
@@ -472,7 +580,7 @@
         score += Math.min(seeds, 100) * 1.5;
 
         // Голодні роздачі — біль при перегляді, хай який реліз хороший.
-        // Штраф з'їдає мовний бонус: краще RUS з 50 сідами, ніж UKR із 2
+        // Цей бал порівнює релізи лише всередині мовного пріоритету
         if (seeds < 3)      score -= 150;
         else if (seeds < 8) score -= 70;
 
@@ -480,7 +588,7 @@
     }
 
     function passesFilters(item) {
-        var t = (item.Title || '').toLowerCase();
+        var t = mediaText(item);
         var sizeGb = (item.Size || 0) / 1073741824;
         var maxGb = sizeLimit();
         var minSeeds = parseInt(cfg('seeds', 1), 10) || 0;
@@ -504,7 +612,10 @@
     /* ---------- 2. Пошук у Jackett ---------- */
 
     function normalizeResult(item) {
-        item = item || {};
+        if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+        var copy = {};
+        Object.keys(item).forEach(function (k) { if (k !== '__proto__') copy[k] = item[k]; });
+        item = copy;
 
         // Jackett-сумісні парсери не завжди дотримуються регістру полів.
         // Зводимо найпоширеніші варіанти до одного формату.
@@ -513,13 +624,43 @@
         if (item.Seeders === undefined) item.Seeders = item.seeders || item.Seeds || item.seeds || 0;
         if (!item.MagnetUri) item.MagnetUri = item.magnetUri || item.magnet || '';
         if (!item.Link) item.Link = item.link || item.DownloadUri || item.downloadUrl || '';
-
+        item.Title = String(item.Title || '');
+        item.Size = Math.max(0, Number(item.Size) || 0);
+        item.Seeders = Math.max(0, parseInt(item.Seeders, 10) || 0);
+        if (!isFinite(item.Size)) item.Size = 0;
+        if (typeof item.MagnetUri !== 'string') item.MagnetUri = '';
+        if (typeof item.Link !== 'string') item.Link = '';
         return item;
     }
 
     function search(query, done, fail) {
-        var url = (Lampa.Storage.get('jackett_url', '') || '').trim();
-        var key = (Lampa.Storage.get('jackett_key', '') || '').trim();
+        function results(json) {
+            var list = Array.isArray(json) ? json :
+                (json && (json.Results || json.results || (json.data && (json.data.Results || json.data.results)))) || [];
+            return Array.isArray(list) ? list.map(normalizeResult).filter(Boolean) : [];
+        }
+        // Use the same configured parser and primary/secondary sources as Lampa.
+        // Its network instance is shared: cancellation must NOT call Parser.clear().
+        if (Lampa.Parser && typeof Lampa.Parser.get === 'function') {
+            var settled = false;
+            var release = trackRequest(function () { settled = true; });
+            try {
+                Lampa.Parser.get({ search: query, from_search: true }, function (json) {
+                    if (settled) return;
+                    settled = true; release(); done(results(json));
+                }, function () {
+                    if (settled) return;
+                    settled = true; release(); fail('Налаштований парсер не відповів або відхилив запит');
+                });
+            } catch (e) {
+                if (!settled) { settled = true; release(); fail('Не вдалося звернутися до налаштованого парсера'); }
+            }
+            return function () { settled = true; release(); };
+        }
+        // Older Lampa builds may not expose Parser.get.
+        var second = Lampa.Storage.get('parser_use_link', 'one') === 'two';
+        var url = String(Lampa.Storage.get(second ? 'jackett_url_two' : 'jackett_url', '') || '').trim();
+        var key = String(Lampa.Storage.get(second ? 'jackett_key_two' : 'jackett_key', '') || '').trim();
 
         if (!url) return fail('Не вказано адресу парсера в налаштуваннях');
 
@@ -534,15 +675,20 @@
             '&Query=' + encodeURIComponent(query);
 
         var net = new Lampa.Reguest();
+        if (net.timeout) net.timeout(15000);
+        var untrack = trackRequest(function () { if (net.clear) net.clear(); });
 
         net.native(api, function (json) {
+            untrack();
             // Частина проксі повертає масив напряму або використовує lower-case.
-            var list = Array.isArray(json) ? json :
-                ((json && (json.Results || json.results || (json.data && (json.data.Results || json.data.results)))) || []);
-            done(Array.isArray(list) ? list.map(normalizeResult) : []);
-        }, function () {
-            fail('Парсер не відповідає');
+            if (json && (json.Error || json.error)) return fail('Парсер повернув помилку — перевір його налаштування');
+            done(results(json));
+        }, function (xhr) {
+            untrack();
+            fail(xhr && (xhr.status === 401 || xhr.status === 403) ?
+                'Парсер відхилив доступ — перевір ключ' : 'Парсер не відповідає');
         }, false, { dataType: 'json' });
+        return function () { untrack(); if (net.clear) net.clear(); };
     }
 
     /* ---------- 3. Запуск у TorrServe ---------- */
@@ -551,7 +697,7 @@
         var u = '';
         try { u = Lampa.Torserver.url(); } catch (e) {}
         if (!u) u = Lampa.Storage.get('torrserver_url', '');
-        u = (u || '').trim();
+        u = String(u || '').trim();
         if (u && !/^https?:\/\//i.test(u)) u = 'http://' + u;
         return u.replace(/\/+$/, '');
     }
@@ -559,9 +705,19 @@
     // POST на /torrents з JSON-тілом
     function tsApi(body, done, fail) {
         var url = tsUrl();
-        if (!url) return fail('Не вказано адресу TorrServe');
-
-        var xhr = new XMLHttpRequest();
+        function problem(message, terminal) { return { message: message, terminal: !!terminal }; }
+        if (!url) return fail(problem('Не вказано адресу TorrServe', true));
+        if (!/^https?:\/\/[^\s/?#]+(?:\/[^\s?#]*)?$/i.test(url) || /@/.test(url)) {
+            return fail(problem('Некоректна адреса TorrServe', true));
+        }
+        var xhr, settled = false, untrack = function () {};
+        function finish(error, data) {
+            if (settled) return;
+            settled = true; untrack();
+            if (error) fail(error); else done(data);
+        }
+        try {
+        xhr = new XMLHttpRequest();
         xhr.open('POST', url + '/torrents', true);
         xhr.setRequestHeader('Content-Type', 'application/json');
         xhr.timeout = 15000;
@@ -577,31 +733,36 @@
         }
 
         xhr.onload = function () {
-            if (xhr.status < 200 || xhr.status >= 300) return fail('TorrServe відповів кодом ' + xhr.status);
+            if (xhr.status < 200 || xhr.status >= 300) return finish(problem(
+                xhr.status === 401 || xhr.status === 403 ? 'TorrServe відхилив доступ — перевір логін і пароль' :
+                'TorrServe відповів кодом ' + xhr.status, xhr.status === 401 || xhr.status === 403 || xhr.status === 404 || xhr.status === 0));
             var data;
             try { data = JSON.parse(xhr.responseText); }
-            catch (e) { return fail('TorrServe повернув некоректну відповідь'); }
-            done(data);
+            catch (e) { return finish(problem('TorrServe повернув некоректну відповідь', true)); }
+            finish(null, data);
         };
-        xhr.onerror = function () { fail('Немає зв\'язку з TorrServe'); };
-        xhr.ontimeout = function () { fail('TorrServe не відповідає'); };
-
+        xhr.onerror = function () { finish(problem('Немає зв’язку з TorrServe. Перевір адресу, мережу та доступ із цього пристрою', true)); };
+        xhr.ontimeout = function () { finish(problem('TorrServe не відповів за 15 с', true)); };
+        untrack = trackRequest(function () { settled = true; xhr.abort(); });
         xhr.send(JSON.stringify(body));
+        } catch (e) { finish(problem('Не вдалося виконати запит до TorrServe', true)); }
     }
 
     // Чекаємо, поки торрент підтягне метадані і віддасть список файлів
     function waitFiles(hash, done, fail) {
         var requestId = operation, finished = false, next;
         var deadline = setTimeout(function () { finish(null, 'Метадані не отримано за 20 с'); }, 20000);
+        var untrack = trackRequest(function () { finish(null, 'Скасовано'); });
         function finish(files, error) {
             if (finished) return;
             finished = true;
             clearTimeout(deadline); clearTimeout(next);
-            if (requestId !== operation) return;
+            untrack();
+            if (!current(requestId)) return;
             if (error) fail(error); else done(files);
         }
         function poll() {
-            if (finished || requestId !== operation) return finish(null, 'Скасовано');
+            if (finished || !current(requestId)) return finish(null, 'Скасовано');
             tsApi({ action: 'get', hash: hash }, function (data) {
                 if (finished) return;
                 var files = data && data.file_stats;
@@ -613,7 +774,7 @@
     }
 
     // Які сезони реально лежать у файлах роздачі та чи є там обраний
-    function filesForSeason(videos, season) {
+    function filesForSeason(videos, season, releaseTitle) {
         function seasonsOf(path) {
             // Найближчий до файлу маркер важливіший за назву батьківської колекції.
             var parts = String(path || '').split(/[\\/]/);
@@ -625,7 +786,8 @@
         }
 
         var bySeason = videos.filter(function (f) {
-            return seasonsOf(f.path).indexOf(season) !== -1;
+            var marked = seasonsOf(f.path);
+            return marked.length === 1 && marked[0] === season;
         });
 
         if (bySeason.length) return { files: bySeason, wrong: null };
@@ -639,8 +801,38 @@
 
         if (marked.length) return { files: [], wrong: marked };
 
-        // Файли без маркерів сезону (одинарний немаркований пак) — довіряємо назві роздачі
-        return { files: videos, wrong: null };
+        // An unmarked file is safe only inside a single-season release.
+        var releaseSeasons = seasonsOfText(releaseTitle);
+        return releaseSeasons.length === 1 && releaseSeasons[0] === season ?
+            { files: videos, wrong: null } : { files: [], wrong: [] };
+    }
+
+    function releaseSeasonText(item) {
+        var general = item.general || {};
+        return String(item.Title || '') + (general.season ? ' сезон ' + String(general.season) : '');
+    }
+
+    function baseName(path) { return String(path || '').split(/[\\/]/).pop(); }
+    function episodeOf(path) {
+        var name = baseName(path).replace(/_/g, ' '), m;
+        var patterns = [/\bs\d{1,2}[ .-]*e(?:p)?[ .-]*(\d{1,3})(?!\d)/i,
+            /\b\d{1,2}x(\d{1,3})(?!\d)/i, /\be(?:p)?[ .-]*(\d{1,3})(?!\d)/i,
+            /(?:episode|серія|серия)[ .:№-]*(\d{1,3})(?!\d)/i,
+            /\b(\d{1,3})[ .-]*(?:серія|серия|episode)/i,
+            /^(\d{1,3})(?=[ ._-]|\.[a-z]+$)/i];
+        for (var i = 0; i < patterns.length; i++) {
+            m = name.match(patterns[i]);
+            if (m && Number(m[1]) > 0) return Number(m[1]);
+        }
+        return 0;
+    }
+
+    function cardKey(card) {
+        return [card.source || 'tmdb', isSeriesCard(card) ? 'tv' : 'movie', card.id || card.original_title || card.original_name || card.title || card.name].join(':');
+    }
+
+    function escapeText(value) {
+        return String(value || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
 
     /* ---------- 3а. Пам'ять «Дивитись далі» ---------- */
@@ -648,24 +840,37 @@
     function contAll() {
         var v = Lampa.Storage.get(STORE.cont, '{}');
         if (typeof v === 'string') { try { v = JSON.parse(v); } catch (e) { v = {}; } }
-        return v || {};
+        if (!v || typeof v !== 'object' || Array.isArray(v)) return {};
+        var valid = {};
+        Object.keys(v).forEach(function (k) {
+            var entry = v[k];
+            if (entry && typeof entry === 'object' && entry.card && typeof entry.card === 'object' && typeof entry.link === 'string') valid[k] = entry;
+        });
+        return valid;
     }
 
     function contSave(card, data) {
         var all = contAll();
-        var id = 'c' + (card.id || (card.title || card.name));
+        var id = cardKey(card);
+        delete all['c' + (card.id || card.title || card.name)];
 
         all[id] = {
             id: id,
             time: Date.now(),
             season: data.season,
             epIndex: data.epIndex,
+            episode: data.episode,
+            path: data.path,
+            hash: data.hash,
+            position: data.position || 0,
+            verified: data.verified,
             epTitle: data.epTitle,
             link: data.link,
             languages: data.languages,
             releaseTitle: data.releaseTitle,
             card: {
                 id: card.id,
+                source: card.source, media_type: isSeriesCard(card) ? 'tv' : 'movie',
                 title: card.title, name: card.name,
                 original_title: card.original_title, original_name: card.original_name,
                 first_air_date: card.first_air_date,
@@ -680,21 +885,22 @@
         keys.slice(15).forEach(function (k) { delete all[k]; });
 
         Lampa.Storage.set(STORE.cont, JSON.stringify(all));
-        Lampa.Noty.show('✓ Збережено для «Дивитись далі»');
     }
 
     function contGet(card) {
-        return contAll()['c' + (card.id || (card.title || card.name))] || null;
+        var all = contAll();
+        return all[cardKey(card)] || all['c' + (card.id || (card.title || card.name))] || null;
     }
 
     // Продовження зі збереженої роздачі; якщо вона померла — звичайний пошук
     function resumeSaved(saved) {
-        operation++;
+        var requestId = beginOperation();
+        if (!saved || !saved.card) return report('Збережений запис пошкоджено');
         var card = saved.card;
-        if (voiceMode() === 'ukr' && !(saved.languages && saved.languages.ukr)) {
-            Lampa.Noty.show('Шукаю українську озвучку замість попереднього релізу');
-            return findBest(card, true);
-        }
+        var opts = { season: saved.season || 0, episode: saved.episode || episodeOf(saved.epTitle),
+            path: saved.path || saved.epTitle, hash: saved.hash, episodeIndex: saved.epIndex, position: saved.position || 0 };
+        var language = voiceMode();
+        if (language === 'ukr' && !(saved.languages && saved.languages.ukr)) return findBest(card, true, opts);
 
         curIsSeries = true;
         curSeason = saved.season || 0;
@@ -703,10 +909,13 @@
 
         Lampa.Noty.show('Відновлюю: ' + (saved.epTitle || 'останню серію'));
 
-        playInTorrserve({ MagnetUri: saved.link, Title: saved.releaseTitle || '' }, card, function () {
+        playInTorrserve({ MagnetUri: saved.link, Title: saved.releaseTitle || '',
+            Audio: saved.languages ? (saved.languages.ukr ? 'ukr ' : '') + (saved.languages.rus ? 'rus' : '') : '' }, card, function (retryOpts, error) {
+            if (!current(requestId)) return;
+            if (error && error.terminal) return report(error.message, 'server');
             Lampa.Noty.show('Збережена роздача недоступна — шукаю заново');
-            findBest(card, true);
-        }, { episodeIndex: saved.epIndex });
+            findBest(card, true, retryOpts || opts);
+        }, opts);
     }
 
     /* ---------- 3б. Буферизація перед стартом ---------- */
@@ -719,10 +928,12 @@
         var t0 = Date.now();
         var lastPre = -1, stallAt = Date.now();
         var deadline = setTimeout(finish, 12000);
+        var untrack = trackRequest(finish);
 
         // Штовхаємо TorrServe качати з цієї позиції
-        var xhr = new XMLHttpRequest();
+        var xhr;
         try {
+            xhr = new XMLHttpRequest();
             xhr.open('GET', streamUrl + '&preload', true);
             xhr.timeout = 15000;
             xhr.onload = xhr.onerror = xhr.ontimeout = function () {};
@@ -733,19 +944,20 @@
             if (finished) return;
             finished = true;
             clearTimeout(deadline);
+            untrack();
             try { xhr.abort(); } catch (e) {}
-            if (requestId === operation) done();
+            if (current(requestId)) done();
         }
 
         (function poll() {
             if (finished) return;
-            if (requestId !== operation) return finish();
+            if (!current(requestId)) return finish();
             // Жорстка стеля 12 с — краще легкий фриз на старті, ніж довге чекання
             if (Date.now() - t0 > 12000) return finish();
 
             tsApi({ action: 'get', hash: hash }, function (t) {
                 if (finished) return;
-                if (requestId !== operation) return finish();
+                if (!current(requestId)) return finish();
                 var pre = t && t.preloaded_bytes, size = t && t.preload_size;
 
                 if (pre === undefined || !size) {
@@ -769,227 +981,243 @@
         })();
     }
 
+    // A guard belongs to this playlist only. Switching files rebuilds its timers and
+    // audio handlers; closing the player never schedules another release.
+    function watchPlayback(playlist, card, item, hash, season, onDead) {
+        if (audioGuardCleanup) audioGuardCleanup();
+        var requestId = operation, active = null, timer, removers = [], videoRemovers = [];
+        var failed = false, external = false, lastTime = null, progressed = 0, lastSaved = -15000;
+        var voice = voiceMode(), series = curIsSeries;
+        var player = Lampa.Player, video = Lampa.PlayerVideo;
+        function listen(bus, name, fn, bag) {
+            if (!bus || !bus.follow || !bus.remove) return;
+            bus.follow(name, fn);
+            bag.push(function () { bus.remove(name, fn); });
+        }
+        function clearVideo() {
+            clearTimeout(timer);
+            videoRemovers.forEach(function (remove) { remove(); });
+            videoRemovers = [];
+        }
+        function cleanup() {
+            clearVideo(); active = null;
+            removers.forEach(function (remove) { remove(); });
+            removers = [];
+            if (audioGuardCleanup === cleanup) audioGuardCleanup = null;
+        }
+        function owns(data) {
+            if (!current(requestId) || active !== data || failed || external) return false;
+            if (player.playdata) {
+                var work = player.playdata();
+                if (work && work.url && work !== data && work.url !== data.url) return false;
+            }
+            return true;
+        }
+        function remember(data, verified) {
+            if (!series) return;
+            contSave(card, { season: season, episode: data.bq_episode, epIndex: data.bq_index,
+                epTitle: data.title, path: data.path, hash: hash, position: data.bq_position || 0,
+                link: item.MagnetUri || item.Link, languages: releaseLanguages(item),
+                releaseTitle: item.Title, verified: verified });
+        }
+        function fail(data, reason) {
+            if (!owns(data)) return;
+            failed = true;
+            var retry = { season: season, episode: data.bq_episode, path: data.path, hash: hash,
+                episodeIndex: data.bq_index, position: data.bq_position || 0 };
+            cleanup();
+            try { if (player.close) player.close(); } catch (e) {}
+            setTimeout(function () {
+                if (current(requestId)) onDead(retry, { message: reason, reason: 'playback' });
+            }, 250);
+        }
+        function arm(data) {
+            clearTimeout(timer);
+            if (progressed >= 3 || !owns(data)) return;
+            timer = setTimeout(function () { fail(data, 'Плеєр не почав відтворення за 25 с'); }, 25000);
+        }
+        function activate(data) {
+            if (!current(requestId) || active === data) return;
+            clearVideo(); active = data; failed = false; external = false;
+            lastTime = null; progressed = 0; lastSaved = -15000;
+            listen(video && video.listener, 'tracks', function (event) {
+                if (!owns(data) || voice === 'any') return;
+                var tracks = event && event.tracks || [], ukr = -1, rus = -1;
+                for (var i = 0; i < tracks.length; i++) {
+                    var lang = trackLanguage(tracks[i]);
+                    if (lang === 'ukr' && ukr < 0) ukr = i;
+                    if (lang === 'rus' && rus < 0) rus = i;
+                }
+                var target = voice === 'rus' ? rus : ukr >= 0 ? ukr : voice === 'ukr_rus' ? rus : -1;
+                if (target < 0 && tracks.length && voice === 'ukr') return fail(data, 'У файлі не підтверджено українську аудіодоріжку');
+                if (target >= 0) {
+                    try {
+                        // Disable others before enabling the target: HLS/DASH use setters.
+                        for (var n = 0; n < tracks.length; n++) {
+                            if (n !== target) { tracks[n].enabled = false; tracks[n].selected = false; }
+                        }
+                        tracks[target].enabled = true;
+                        tracks[target].selected = true;
+                    } catch (e) { return fail(data, 'Плеєр не дозволив перемкнути аудіодоріжку'); }
+                }
+            }, videoRemovers);
+            listen(video && video.listener, 'timeupdate', function (event) {
+                if (!owns(data)) return;
+                var now = Number(event && event.current);
+                if (!isFinite(now) || now < 0) return;
+                // One seek/timeupdate is not proof of decoding. Require continued progress.
+                if (lastTime !== null && now > lastTime && now - lastTime < 5) progressed += now - lastTime;
+                lastTime = now; data.bq_position = now;
+                if (progressed >= 3) {
+                    clearTimeout(timer);
+                    lastReport.status = 'Вбудований плеєр відтворює відео';
+                    if (Date.now() - lastSaved >= 15000) { remember(data, true); lastSaved = Date.now(); }
+                }
+            }, videoRemovers);
+            listen(video && video.listener, 'pause', function () { clearTimeout(timer); }, videoRemovers);
+            listen(video && video.listener, 'play', function () { arm(data); }, videoRemovers);
+        }
+        playlist.forEach(function (data) {
+            data.error = function () { fail(data, 'Плеєр повідомив про помилку відтворення'); };
+        });
+        listen(player.listener, 'create', function (event) {
+            var data = event && event.data;
+            if (playlist.indexOf(data) >= 0) activate(data);
+            else cleanup();
+        }, removers);
+        listen(player.listener, 'ready', function (data) {
+            if (active && (!data || data === active || data.url === active.url)) arm(active);
+        }, removers);
+        listen(player.listener, 'external', function (data) {
+            if (playlist.indexOf(data) < 0 || !current(requestId)) return;
+            clearVideo(); external = true;
+            remember(data, false);
+            lastReport.status = 'Передано зовнішньому плеєру; відтворення й доріжку він не підтверджує';
+        }, removers);
+        listen(player.listener, 'destroy', function () {
+            if (active && !failed && !external && progressed >= 3) remember(active, true);
+            clearVideo(); active = null;
+        }, removers);
+        audioGuardCleanup = cleanup;
+        return activate;
+    }
+
     function playInTorrserve(item, card, onDead, opts) {
-        var requestId = operation;
+        var requestId = operation, ended = false;
         var season = curSeason, series = curIsSeries;
         var link = item.MagnetUri || item.Link;
-        var title = card.title || card.name;
-
-        if (!link) {
-            if (onDead) return onDead();
-            return Lampa.Noty.show('У релізу немає magnet-посилання');
+        var title = card.title || card.name || '';
+        opts = opts || {};
+        function reject(error, retry) {
+            if (ended || !current(requestId)) return;
+            ended = true;
+            error = typeof error === 'object' && error ? error : { message: String(error || 'Кандидат не підійшов'), reason: 'metadata' };
+            if (onDead) onDead(retry || opts, error);
+            else report(error.message);
         }
-
-        tsApi({
-            action: 'add',
-            link: link,
-            title: title,
-            poster: card.poster_path ? Lampa.Api.img(card.poster_path) : '',
-            save_to_db: true
+        if (!link) return reject('У релізу немає посилання');
+        tsApi({ action: 'add', link: link, title: title,
+            poster: card.poster_path && Lampa.Api && Lampa.Api.img ? Lampa.Api.img(card.poster_path) : '',
+            save_to_db: false
         }, function (torrent) {
-            if (requestId !== operation) return;
+            if (ended || !current(requestId)) return;
             var hash = torrent && torrent.hash;
-            if (!hash) {
-                if (onDead) return onDead();
-                return Lampa.Noty.show('TorrServe не повернув хеш роздачі');
-            }
-
+            if (!hash) return reject('TorrServe не повернув хеш роздачі');
             waitFiles(hash, function (files) {
-                if (requestId !== operation) return;
-                // Індекс TorrServe стосується початкового списку, до фільтрації та сортування.
+                if (ended || !current(requestId)) return;
                 var videos = files.map(function (f, index) {
-                    return { path: String(f.path || ''), length: f.length,
+                    f = f || {};
+                    return { path: String(f.path || ''), length: Math.max(0, Number(f.length) || 0),
                         id: f.id !== undefined && f.id !== null ? f.id : index + 1 };
                 }).filter(function (f) {
-                    if (!/\.(mkv|mp4|avi|ts|m4v|mov)$/i.test(f.path)) return false;
-                    // Семпли й трейлери в паках ламають плеєр
-                    if (/\b(sample|семпл|trailer|трейлер)\b/i.test(f.path)) return false;
-                    return true;
+                    return /\.(mkv|mp4|avi|ts|m4v|mov|webm|m2ts)$/i.test(f.path) &&
+                        !/(^|[^a-zа-яіїєґ])(sample|семпл|trailer|трейлер)(?=$|[^a-zа-яіїєґ])/i.test(f.path);
                 });
-
-                if (!videos.length) {
-                    if (onDead) return onDead();
-                    return Lampa.Noty.show('У роздачі немає відеофайлу');
-                }
-
-                function streamOf(f, pos) {
-                    var idx = (f.id !== undefined && f.id !== null) ? f.id : (pos + 1);
-                    return tsUrl() + '/stream/' +
-                        encodeURIComponent(f.path.split('/').pop()) +
-                        '?link=' + hash + '&index=' + idx + '&play';
-                }
-
-                function timelineOf(f) {
-                    try { return Lampa.Timeline.view(hash + '_' + (f.id || f.path)); }
-                    catch (e) { return card.timeline; }
-                }
-
-                function playerData(f, url, name, list, retryOpts) {
-                    var failed = false, startedAt = Date.now();
-                    var data = {
-                        url: url,
-                        title: name,
-                        path: f.path,
-                        torrent_hash: hash,
-                        timeline: timelineOf(f),
-                        playlist: list,
-                        quality: false,
-                        // Вбудований плеєр повідомляє про фатальну помилку через цей callback.
-                        // На старті автоматично пробуємо інший реліз; після 60 с це вже
-                        // схоже на обрив поточного перегляду, а не несумісний файл.
-                        error: function () {
-                            if (failed || requestId !== operation || Date.now() - startedAt > 60000) return;
-                            failed = true;
-                            try { if (Lampa.Player.close) Lampa.Player.close(); } catch (e) {}
-                            setTimeout(function () {
-                                if (requestId === operation && onDead) onDead(retryOpts);
-                            }, 250);
-                        }
-                    };
-                    if (audioGuardCleanup) audioGuardCleanup();
-                    var videoApi = Lampa.PlayerVideo;
-                    if (voiceMode() === 'ukr' && videoApi && videoApi.listener &&
-                        videoApi.listener.follow && videoApi.listener.remove) {
-                        var listener = videoApi.listener;
-                        function cleanup() {
-                            listener.remove('tracks', chooseAudio);
-                            if (Lampa.Player.listener && Lampa.Player.listener.remove) {
-                                Lampa.Player.listener.remove('destroy', cleanup);
-                            }
-                            if (audioGuardCleanup === cleanup) audioGuardCleanup = null;
-                        }
-                        function chooseAudio(event) {
-                            if (requestId !== operation) return cleanup();
-                            var tracks = event && event.tracks || [], target = -1, known = false;
-                            for (var n = 0; n < tracks.length; n++) {
-                                var track = tracks[n];
-                                var language = String(track.language || track.lang || '').toLowerCase();
-                                if (language && language !== 'und') known = true;
-                                if (/^(uk|ukr|uk-.*)$/.test(language) ||
-                                    releaseLanguages(String(track.label || track.title || '')).ukr) target = n;
-                            }
-                            if (target >= 0) {
-                                // Та сама властивість enabled, яку використовує Lampa Video.
-                                for (var i = 0; i < tracks.length; i++) {
-                                    tracks[i].enabled = i === target;
-                                    tracks[i].selected = i === target;
-                                }
-                                cleanup();
-                            } else if (known && tracks.length) {
-                                cleanup();
-                                Lampa.Noty.show('Української аудіодоріжки у файлі немає — шукаю інший реліз');
-                                data.error();
-                            }
-                        }
-                        listener.follow('tracks', chooseAudio);
-                        if (Lampa.Player.listener && Lampa.Player.listener.follow) {
-                            Lampa.Player.listener.follow('destroy', cleanup);
-                        }
-                        audioGuardCleanup = cleanup;
-                    }
-                    return data;
-                }
-
-                // Перевіряємо сезон і для одного відеофайлу.
+                if (!videos.length) return reject('У роздачі немає відеофайлу');
                 if (series && season > 0) {
-                    var sel = filesForSeason(videos, season);
-                    if (sel.wrong) {
-                        Lampa.Noty.show('Файли не містять обраного сезону ' + season);
-                        if (onDead) onDead();
-                        return;
+                    var selected = filesForSeason(videos, season, releaseSeasonText(item));
+                    if (selected.wrong) return reject('Файли не підтверджують обраний сезон ' + season);
+                    videos = selected.files;
+                }
+                if (!videos.length) return reject('У роздачі немає обраного сезону');
+                if (!series) videos = [videos.sort(function (a, b) { return b.length - a.length; })[0]];
+                else videos.sort(function (a, b) {
+                    var difference = episodeOf(a.path) - episodeOf(b.path);
+                    if (difference) return difference;
+                    // ES5 comparison also works on older television browsers.
+                    return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
+                });
+                var playlist = videos.map(function (f, index) {
+                    var episode = episodeOf(f.path);
+                    var timelineKey = series && season && episode ? cardKey(card) + ':s' + season + ':e' + episode : hash + '_' + f.id;
+                    var timeline;
+                    try { timeline = Lampa.Timeline.view(timelineKey); } catch (e) { timeline = card.timeline; }
+                    return { url: tsUrl() + '/stream/' + encodeURIComponent(baseName(f.path)) +
+                        '?link=' + encodeURIComponent(hash) + '&index=' + encodeURIComponent(f.id) + '&play',
+                        title: series ? baseName(f.path) : title, path: f.path, torrent_hash: hash,
+                        timeline: timeline, quality: false, card: card, ffprobe: Array.isArray(item.ffprobe) ? item.ffprobe : undefined,
+                        bq_episode: episode, bq_index: index, bq_position: 0 };
+                });
+                // No circular references: external players serialize this array.
+                var externalPlaylist = playlist.map(function (data) {
+                    return { url: data.url, title: data.title, path: data.path, torrent_hash: hash };
+                });
+                playlist.forEach(function (data) { data.playlist = externalPlaylist; });
+                function playEpisode(index) {
+                    if (ended || !current(requestId)) return;
+                    if (!isFinite(index) || Math.floor(index) !== index || index < 0 || index >= playlist.length) return reject('Потрібної серії немає у цій роздачі');
+                    var data = playlist[index];
+                    if (opts.position > 0 && data.timeline && typeof data.timeline === 'object') {
+                        data.timeline.time = opts.position;
+                        data.bq_position = opts.position;
                     }
-                    videos = sel.files;
-                }
-
-                // Фільм або одиночний файл — граємо одразу
-                if (!series || videos.length === 1) {
-                    var video = videos.sort(function (a, b) { return b.length - a.length; })[0];
-                    var mUrl = streamOf(video, 0);
-
-                    if (series) contSave(card, {
-                        season: season, epIndex: 0,
-                        epTitle: video.path.split('/').pop(), link: link,
-                        languages: releaseLanguages(item), releaseTitle: item.Title
-                    });
-
-                    warmUp(hash, mUrl, function () {
-                        if (requestId !== operation) return;
-                        var one = playerData(video, mUrl, title, null,
-                            series ? { episodeIndex: 0 } : null);
-                        Lampa.Player.play(one);
-                        Lampa.Player.playlist([{ url: mUrl, title: title, path: video.path,
-                            torrent_hash: hash, timeline: one.timeline }]);
-                    });
-                    return;
-                }
-
-                // Серіал: серії за номерами, вибір + плейлист
-                videos.sort(function (a, b) {
-                    return a.path.localeCompare(b.path, undefined, { numeric: true, sensitivity: 'base' });
-                });
-
-                var playlist = videos.map(function (f, i) {
-                    return { url: streamOf(f, i), title: f.path.split('/').pop(), path: f.path,
-                        torrent_hash: hash, timeline: timelineOf(f) };
-                });
-
-                function playEpisode(idx) {
-                    if (requestId !== operation) return;
-                    idx = Math.max(0, Math.min(idx, playlist.length - 1));
-
-                    contSave(card, {
-                        season: season, epIndex: idx,
-                        epTitle: playlist[idx].title, link: link,
-                        languages: releaseLanguages(item), releaseTitle: item.Title
-                    });
-
-                    warmUp(hash, playlist[idx].url, function () {
-                        if (requestId !== operation) return;
-                        Lampa.Player.play(playerData(videos[idx], playlist[idx].url,
-                            playlist[idx].title, playlist, { episodeIndex: idx }));
-                        Lampa.Player.playlist(playlist);
+                    warmUp(hash, data.url, function () {
+                        if (ended || !current(requestId)) return;
+                        var activate = watchPlayback(playlist, card, item, hash, season, function (retry, error) { reject(error, retry); });
+                        activate(data);
+                        try {
+                            Lampa.Player.play(data);
+                            Lampa.Player.playlist(playlist);
+                        } catch (e) {
+                            if (audioGuardCleanup) audioGuardCleanup();
+                            reject('Не вдалося запустити плеєр', { season: season, episode: data.bq_episode, path: data.path, hash: hash });
+                        }
                     });
                 }
-
-                // Продовження: серія відома — стартуємо без діалогу
-                if (opts && opts.episodeIndex !== undefined) return playEpisode(opts.episodeIndex);
-
-                Lampa.Select.show({
-                    title: 'Яка серія?',
-                    items: videos.map(function (f, i) {
-                        return { title: f.path.split('/').pop(), index: i };
-                    }),
-                    onSelect: function (item) {
-                        Lampa.Controller.toggle('content');
-                        playEpisode(item.index);
-                    },
-                    onBack: function () { Lampa.Controller.toggle('content'); }
+                // Across releases an episode number is stable; its array index is not.
+                if (series && (opts.episode || opts.path || opts.episodeIndex !== undefined)) {
+                    var wanted = Number(opts.episode) || episodeOf(opts.path), chosen = -1;
+                    for (var n = 0; n < playlist.length; n++) {
+                        if (wanted ? playlist[n].bq_episode === wanted : opts.path && baseName(playlist[n].path) === baseName(opts.path)) { chosen = n; break; }
+                    }
+                    if (chosen < 0 && !wanted && !opts.path && opts.hash === hash) chosen = Number(opts.episodeIndex);
+                    return playEpisode(chosen);
+                }
+                if (!series || playlist.length === 1) return playEpisode(0);
+                Lampa.Select.show({ title: 'Яка серія?',
+                    items: playlist.map(function (data, index) { return { title: escapeText(data.title), index: index }; }),
+                    onSelect: function (selected) { Lampa.Controller.toggle('content'); playEpisode(selected.index); },
+                    onBack: function () { if (current(requestId)) beginOperation(); Lampa.Controller.toggle('content'); }
                 });
-            }, function (msg) {
-                if (requestId !== operation) return;
-                // Таймаут не доводить, що роздача мертва; вона могла вже бути у користувача.
-                if (onDead) return onDead();
-                Lampa.Noty.show(msg);
-            });
-        }, function (msg) {
-            if (requestId !== operation) return;
-            if (onDead) return onDead();
-            Lampa.Noty.show(msg);
-        });
+            }, reject);
+        }, reject);
     }
 
     /* ---------- 4. Кнопка на картці фільму ---------- */
 
-    function findBest(card, skipSaved) {
-        var requestId = ++operation;
-        var title = card.title || card.name || '';
-        var original = card.original_title || card.original_name || '';
+    function findBest(card, skipSaved, target) {
+        var requestId = beginOperation();
+        card = card || {};
+        target = target || {};
+        lastReport = { status: 'Пошук', found: 0, candidates: 0, tried: 0, reasons: {} };
+        var title = String(card.title || card.name || '');
+        var original = String(card.original_title || card.original_name || '');
 
         curRuntime = parseInt(card.runtime, 10) || 0;
         // Серіал: у картки є name/first_air_date замість title/release_date
         curIsSeries = isSeriesCard(card);
         curMaxSeason = parseInt(card.number_of_seasons, 10) || 0;
-        curYear = parseInt((card.release_date || card.first_air_date || '').slice(0, 4), 10) || 0;
+        curYear = parseInt(String(card.release_date || card.first_air_date || '').slice(0, 4), 10) || 0;
 
         Lampa.Noty.show('Шукаю найкращий реліз…');
 
@@ -1000,15 +1228,15 @@
                 title: (card.title || card.name),
                 items: [
                     { title: '▶ Продовжити: ' + (saved.epTitle || ('сезон ' + saved.season)), act: 'resume' },
-                    { title: 'Обрати інший сезон / серію / реліз', act: 'new' }
+                    { title: 'Обрати інший сезон / серію', act: 'new' }
                 ],
                 onSelect: function (item) {
-                    if (requestId !== operation) return;
+                    if (!current(requestId)) return;
                     Lampa.Controller.toggle('content');
                     if (item.act === 'resume') resumeSaved(saved);
                     else doSearch();
                 },
-                onBack: function () { Lampa.Controller.toggle('content'); }
+                onBack: function () { if (current(requestId)) beginOperation(); Lampa.Controller.toggle('content'); }
             });
             return;
         }
@@ -1016,18 +1244,24 @@
         doSearch();
 
         function doSearch() {
-            if (requestId !== operation) return;
-            russianTitle(card, runSearch);
+            if (!current(requestId)) return;
+            var translated = {}, remaining = 2;
+            ['ru', 'uk'].forEach(function (language) {
+                localizedTitle(card, language, function (text) {
+                    translated[language] = text;
+                    if (--remaining === 0) runSearch(translated.ru, translated.uk);
+                });
+            });
         }
 
-        function runSearch(ruTitle) {
-            if (requestId !== operation) return;
+        function runSearch(ruTitle, ukTitle) {
+            if (!current(requestId)) return;
             // Різні індексатори по-різному обробляють апострофи, тире та рік.
             // Тому формуємо кілька компактних варіантів, але без дублювання.
             var queries = [], querySeen = {};
 
             function addQuery(q) {
-                q = (q || '').replace(/\s+/g, ' ').trim();
+                q = String(q || '').replace(/\s+/g, ' ').trim();
                 if (!q) return;
                 var key = q.toLowerCase();
                 if (querySeen[key]) return;
@@ -1053,6 +1287,7 @@
             addQuery(title);
             addQuery(original);
             addQuery(ruTitle);
+            addQuery(ukTitle);
             addTitleVariants(ruTitle);
             addTitleVariants(title);
             addTitleVariants(original);
@@ -1069,18 +1304,28 @@
             function add(list) {
                 (list || []).forEach(function (i) {
                     i = normalizeResult(i);
-                    var key = i.Guid || i.InfoHash || i.MagnetUri || i.Link ||
-                        ((i.Title || '').toLowerCase() + '|' + (i.Size || 0));
-                    if (seen[key]) return;
-                    seen[key] = true;
+                    if (!i || !i.Title) return;
+                    var magnetHash = (i.MagnetUri || '').match(/xt=urn:btih:([a-z0-9]+)/i);
+                    var key = '$' + String(i.InfoHash || i.infohash || (magnetHash && magnetHash[1]) || i.MagnetUri || i.Link || i.Guid ||
+                        (i.Title.toLowerCase() + '|' + i.Size)).toLowerCase();
+                    if (seen[key]) {
+                        var previous = seen[key];
+                        previous.Seeders = Math.max(previous.Seeders, i.Seeders);
+                        ['ffprobe', 'Audio', 'audio', 'audio_tracks', 'audioTracks', 'info', 'general'].forEach(function (field) {
+                            if (!previous[field] || (Array.isArray(previous[field]) && !previous[field].length)) previous[field] = i[field];
+                        });
+                        return;
+                    }
+                    seen[key] = i;
                     merged.push(i);
                 });
             }
 
             function done() {
                 if (--pending > 0) return;
-                if (!merged.length && failMsg) return Lampa.Noty.show(failMsg);
-                route(merged, card);
+                lastReport.found = merged.length;
+                if (!merged.length && failMsg) return report(failMsg, 'parser');
+                route(merged, card, target);
             }
 
             if (!queries.length) return Lampa.Noty.show('У картки немає назви для пошуку');
@@ -1088,22 +1333,23 @@
             var next = 0;
             function launch() {
                 if (next >= queries.length) return;
-                var q = queries[next++], settled = false;
+                var q = queries[next++], settled = false, cancel;
                 var timer = setTimeout(function () {
+                    if (typeof cancel === 'function') cancel();
                     settle([], 'Перевищено час очікування парсера');
                 }, 15000);
                 function settle(list, error) {
                     if (settled) return;
                     settled = true;
                     clearTimeout(timer);
-                    if (requestId !== operation) return;
+                    if (!current(requestId)) return;
                     if (error) failMsg = error;
                     add(list);
                     done();
                     launch();
                 }
                 try {
-                    search(q, function (list) { settle(list); },
+                    cancel = search(q, function (list) { settle(list); },
                         function (error) { settle([], error); });
                 } catch (e) { settle([], 'Помилка запиту до парсера'); }
             }
@@ -1113,26 +1359,32 @@
     }
 
     // Розводимо фільми та серіали
-    function route(list, card) {
+    function route(list, card, target) {
         var requestId = operation;
-        if (!list.length) return Lampa.Noty.show('Парсер не знайшов жодного релізу');
+        target = target || {};
+        if (!list.length) return report('Парсер не знайшов жодного релізу');
 
         curSeason = 0;
 
-        if (!curIsSeries) return pick(list, card);
+        if (!curIsSeries) return pick(list, card, target);
 
         // Серіал: дізнаємось, які сезони взагалі є в роздачах
         var seasons = extractSeasons(list);
+        if (!seasons.length && curMaxSeason > 1) {
+            for (var n = 1; n <= Math.min(curMaxSeason, 99); n++) seasons.push(n);
+        }
 
         function go(season) {
-            if (requestId !== operation) return;
+            if (!current(requestId)) return;
             curSeason = season;
             var filtered = filterBySeason(list, season);
 
             if (!filtered.length) return Lampa.Noty.show('Роздач сезону ' + season + ' не знайшлося');
 
-            pick(filtered, card);
+            pick(filtered, card, target);
         }
+
+        if (target.season > 0) return go(Number(target.season));
 
         if (seasons.length > 1) {
             Lampa.Select.show({
@@ -1142,18 +1394,21 @@
                     Lampa.Controller.toggle('content');
                     go(item.season);
                 },
-                onBack: function () { Lampa.Controller.toggle('content'); }
+                onBack: function () { if (current(requestId)) beginOperation(); Lampa.Controller.toggle('content'); }
             });
         }
         else if (seasons.length === 1) go(seasons[0]);
-        else pick(list, card);
+        else {
+            // Let file metadata confirm season one; never mix unlabelled seasons.
+            go(1);
+        }
     }
 
     // Номери сезонів, що згадуються в назвах роздач
     function extractSeasons(list) {
         var found = {};
         list.forEach(function (i) {
-            seasonsOfText(i.Title).forEach(function (n) { found[n] = true; });
+            seasonsOfText(releaseSeasonText(i)).forEach(function (n) { found[n] = true; });
         });
 
         return Object.keys(found).map(Number).filter(function (n) {
@@ -1166,7 +1421,8 @@
     // Роздачі потрібного сезону, включно з діапазонами (сезони 1-5, S01-S05)
     function filterBySeason(list, season) {
         return list.filter(function (i) {
-            return seasonsOfText(i.Title).indexOf(Number(season)) !== -1;
+            var marked = seasonsOfText(releaseSeasonText(i));
+            return !marked.length || marked.indexOf(Number(season)) !== -1;
         });
     }
 
@@ -1180,118 +1436,94 @@
         if (/\b\d{1,2}x\d{1,3}\b(?!\s*[-–—]\s*\d)/.test(t)) return true;
         if (/\bs\d{1,2}e\d{1,3}\b(?!\s*[-–—]\s*e?\d)/.test(t) && !/\be\d{1,3}\s*[-–—]\s*e?\d/.test(t)) return true;
         if (/серия[\s.:№]*\d/.test(t) && !/серии/.test(t)) return true;
+        if (/\b\d{1,3}\s+сер[иі]я(?=$|[^а-яіїєґ])/.test(t)) return true;
         return false;
     }
 
-    // Чому не лишилося жодного кандидата — конкретна причина, а не здогадка
-    function rejectReason(list) {
-        var c = {};
-        list.forEach(function (i) { var w = i._why || 'other'; c[w] = (c[w] || 0) + 1; });
-
-        var top = Object.keys(c).sort(function (a, b) { return c[b] - c[a]; })[0];
-        var txt = {
-            cam:    'усі — екранки',
-            hdr:    'усі — HDR/Dolby Vision (зміни налаштування HDR)',
-            '3d':   'усі — 3D',
-            series: 'усі — серіальні роздачі',
-            other:  'жоден не підійшов під фільтри'
-        }[top] || 'жоден не підійшов під фільтри';
-
-        return 'Знайдено ' + list.length + '; найчастіша причина відсіву (' + c[top] + '): ' + txt.replace(/^усі — /, '');
+    function pick(list, card, target) {
+        if (!list.length) return report('Роздач цього сезону не знайшлося');
+        var voice = voiceMode(), maxGb = sizeLimit();
+        var candidates = list.map(normalizeResult).filter(Boolean).filter(function (item) {
+            delete item._why; delete item._relaxed;
+            item._score = scoreRelease(item);
+            if (!item.MagnetUri && !item.Link) item._why = 'link';
+            if (!curIsSeries && maxGb > 0 && item.Size / 1073741824 > maxGb) item._why = 'size';
+            var lang = releaseLanguages(item);
+            if (voice === 'ukr' && !lang.ukr) item._why = 'language';
+            if (item._why) {
+                lastReport.reasons[item._why] = (lastReport.reasons[item._why] || 0) + 1;
+                return false;
+            }
+            item._language = voice === 'any' ? 0 : voice === 'rus' ?
+                (lang.rus ? 0 : !lang.ukr ? 1 : 2) : lang.ukr ? 0 : lang.rus ? 1 : 2;
+            item._compat = compatibilityRank(item);
+            item._relaxed = !passesFilters(item);
+            item._single = curIsSeries && isSingleEpisode(item.Title) ? 1 : 0;
+            return true;
+        });
+        // Lexicographic priorities cannot be reversed by bitrate/seed bonuses.
+        candidates.sort(function (a, b) {
+            return a._language - b._language || a._compat - b._compat ||
+                a._single - b._single || Number(a._relaxed) - Number(b._relaxed) || b._score - a._score;
+        });
+        lastReport.candidates = candidates.length;
+        if (!candidates.length) {
+            var why = lastReport.reasons;
+            return report('Не підійшов жоден із ' + list.length + ' релізів. ' +
+                (why.language ? 'Без підтвердженої української: ' + why.language + '. ' : '') +
+                (why.size ? 'Перевищують ліміт розміру: ' + why.size + '. ' : '') +
+                (why.hdr ? 'HDR/DV відсіяно: ' + why.hdr + '. ' : '') +
+                (why.link ? 'Немає посилання: ' + why.link + '. ' : '') +
+                (!why.language && !why.size && !why.hdr && !why.link ? 'Перевір налаштування якості.' : ''));
+        }
+        tryCandidate(candidates, 0, card, target);
     }
 
-    function pick(list, card) {
-        if (!list.length) return Lampa.Noty.show('Роздач цього сезону не знайшлося');
-
-        var scored = list
-            .map(function (i) {
-                delete i._why;
-                i._score = scoreRelease(i);
-                return i;
-            })
-            // Від'ємний бал означає «слабкий», а не обов'язково «заборонений».
-            // Жорсткі відмови scoreRelease позначає через _why.
-            .filter(function (i) { return !i._why; })
-            .sort(function (a, b) { return b._score - a._score; });
-
-        // Мова задає порядок автоматичної перевірки. Невідомі та запасні
-        // варіанти не губимо: вони підуть після явно бажаної мови.
-        var voice = voiceMode();
-        if (voice === 'ukr') {
-            scored = scored.filter(function (i) { return releaseLanguages(i).ukr; });
-            if (!scored.length) return Lampa.Noty.show('Релізів з підтвердженою українською озвучкою не знайдено. Російська автоматично не підставляється.');
-        }
-        if (voice !== 'any' && scored.length) {
-            var preferred = [], secondary = [], unknown = [], fallback = [];
-            scored.forEach(function (i) {
-                var lang = releaseLanguages(i);
-                if (!lang.ukr && !lang.rus) return unknown.push(i);
-                if (voice === 'ukr' && lang.ukr) return preferred.push(i);
-                if (voice === 'rus' && lang.rus) return preferred.push(i);
-                if (voice === 'ukr_rus' && lang.ukr) return preferred.push(i);
-                if (voice === 'ukr_rus' && lang.rus) return secondary.push(i);
-                fallback.push(i);
-            });
-            // «Українська» — обов’язкова мова; запасні фільтри якості її не змінюють.
-            scored = voice === 'ukr' ? preferred : preferred.concat(secondary, unknown, fallback);
-        }
-
-        // Серіал: сезонні паки важливіші за односерійні релізи —
-        // інакше свіжа серія онгоінга з тисячами сідів «з'їдає» вибір серії
-        if (curIsSeries) {
-            var packs = scored.filter(function (i) { return !isSingleEpisode(i.Title); });
-            if (packs.length) scored = packs;
-        }
-
-        var good = scored.filter(passesFilters);
-        var relaxed = scored.filter(function (i) { return good.indexOf(i) === -1; });
-        relaxed.forEach(function (i) { i._relaxed = true; });
-        var candidates = good.concat(relaxed);
-
-        if (!candidates.length) return Lampa.Noty.show(rejectReason(list));
-
-        tryCandidate(candidates, 0, card);
-    }
-
-    // Пробуємо кандидатів по черзі: мертва роздача -> наступна за рейтингом
     function tryCandidate(candidates, idx, card, opts) {
+        var requestId = operation;
         if (idx >= candidates.length || idx >= 12) {
-            return Lampa.Noty.show('Перевірені кандидати не запустилися. Причиною можуть бути метадані, файли або з’єднання; доступність інших роздач не перевірена.');
+            return report('Перевірено ' + Math.min(idx, candidates.length) + ' кандидатів — запуск не підтверджено. ' +
+                'Причини збережено в «Остання перевірка».');
         }
-
-        var best = candidates[idx];
-        var gb = ((best.Size || 0) / 1073741824).toFixed(1);
-
-        Lampa.Noty.show((best._relaxed ? 'Запасний варіант · ' : (idx ? '№' + (idx + 1) + ': ' : '')) +
-            best.Title + ' · ' + gb + ' ГБ · ' + (best.Seeders || 0) + ' сідів');
-
-        playInTorrserve(best, card, function (retryOpts) {
-            Lampa.Noty.show('Цей кандидат не підійшов, перевіряю наступний…');
+        var best = candidates[idx], settled = false;
+        lastReport.tried++;
+        report((best._relaxed ? 'Запасна якість · ' : '') + 'Перевіряю ' + (idx + 1) + '/' + Math.min(candidates.length, 12) +
+            ': ' + escapeText(best.Title) + ' · ' + best.Seeders + ' сідів');
+        playInTorrserve(best, card, function (retryOpts, error) {
+            if (settled || !current(requestId)) return;
+            settled = true;
+            error = error || {};
+            var reason = error.reason || (error.terminal ? 'server' : 'metadata');
+            lastReport.reasons[reason] = (lastReport.reasons[reason] || 0) + 1;
+            if (error.terminal) return report(error.message || 'Перевір налаштування TorrServe');
+            lastReport.lastFailure = error.message || 'Кандидат не підійшов';
             tryCandidate(candidates, idx + 1, card, retryOpts || opts);
         }, opts);
     }
 
     function addButton(e) {
+        if (window.bq_version !== BQ_VERSION || !e || !e.object || !e.object.activity) return;
         var render = e.object.activity.render();
 
         function insert() {
+            if (window.bq_version !== BQ_VERSION) return;
             // Прибираємо кнопку старої версії плагіна, якщо вона встигла з'явитися
-            render.find('.view--bq').not('.view--bq7').remove();
+            render.find('.view--bq').not('.view--bq-v' + BQ_VERSION).remove();
 
             var row = render.find('.full-start-new__buttons, .full-start__buttons').first();
             var playBtn = row.find('.button--play').first();
 
             // Кнопка вже стоїть у видимому ряду — все гаразд
-            if (row.find('.view--bq7').length) return true;
+            if (row.find('.view--bq-v' + BQ_VERSION).length) return true;
 
-            var btn = $('<div class="full-start__button selector view--bq view--bq7" role="button" aria-label="Дивитись">' +
+            var btn = $('<div class="full-start__button selector view--bq view--bq7 view--bq-v' + BQ_VERSION + '" role="button" aria-label="Дивитись">' +
                 '<svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor" stroke="none">' +
                 '<path d="M13 2L4.5 13.5h5L9.5 22 18 10.5h-5L13 2z"/>' +
                 '</svg>' +
                 '<span>Дивитись</span></div>');
 
             btn.on('hover:enter', function () {
-                findBest(e.data.movie);
+                if (window.bq_version === BQ_VERSION) findBest(e.data.movie);
             });
 
             if (playBtn.length) playBtn.after(btn);
@@ -1322,8 +1554,19 @@
     /* ---------- 5. Налаштування ---------- */
 
     function addSettings() {
+        if (Lampa.SettingsApi.removeParams) Lampa.SettingsApi.removeParams('best_quality');
+        Lampa.Storage.set(STORE.ukr, voiceMode());
+        var selects = { tv: ['auto', 'fhd', 'uhd'], res: ['1080', '2160', 'any'],
+            codec: ['auto', 'any', 'hevc', 'av1', 'avc'], hdr: ['auto', 'prefer', 'ignore', 'avoid'] };
+        Object.keys(selects).forEach(function (key) {
+            var value = cfg(key, selects[key][0]);
+            if (selects[key].indexOf(value) < 0) value = selects[key][0];
+            Lampa.Storage.set(STORE[key], value);
+        });
         var maxgb = Lampa.Storage.get(STORE.maxgb, 'auto');
-        if (maxgb === '' || maxgb === null || maxgb === undefined || maxgb === 'undefined') {
+        var number = Number(String(maxgb).replace(',', '.'));
+        if (maxgb === '' || maxgb === null || maxgb === undefined || maxgb === 'undefined' ||
+            (maxgb !== 'auto' && (!isFinite(number) || number < 0))) {
             Lampa.Storage.set(STORE.maxgb, 'auto');
         }
         Lampa.SettingsApi.addComponent({
@@ -1340,8 +1583,8 @@
 
         Lampa.SettingsApi.addParam({
             component: 'best_quality',
-            param: { name: STORE.ukr, type: 'select', values: { ukr: 'Українська', ukr_rus: 'Українська → староукраїнська', rus: 'Староукраїнська 😅', any: 'Байдуже' }, default: 'ukr' },
-            field: { name: 'Пріоритет озвучки', description: 'Українська — без підміни іншою мовою; Українська → староукраїнська — дозволяє російський запасний варіант. Вбудований плеєр автоматично обирає доступну українську доріжку; зовнішній керує доріжками сам' }
+            param: { name: STORE.ukr, type: 'select', values: { ukr: 'Українська (обов’язково)', ukr_rus: 'Українська → російська', rus: 'Російська → інші', any: 'Байдуже' }, default: 'ukr' },
+            field: { name: 'Мова озвучки', description: 'Українська — відсіює релізи без підтвердження мови. Інші пріоритети дозволяють запасні варіанти. Байдуже — без мовних бонусів. Зовнішній плеєр керує доріжками сам' }
         });
 
         Lampa.SettingsApi.addParam({
@@ -1352,8 +1595,8 @@
 
         Lampa.SettingsApi.addParam({
             component: 'best_quality',
-            param: { name: STORE.res, type: 'select', values: { '2160': 'Тільки 4K', '1080': 'Від 1080p', 'any': 'Будь-яка' }, default: '1080' },
-            field: { name: 'Мінімальна роздільність' }
+            param: { name: STORE.res, type: 'select', values: { '2160': 'Перевага 4K', '1080': 'Перевага 1080p і вище', 'any': 'Будь-яка' }, default: '1080' },
+            field: { name: 'Бажана роздільність', description: 'Якщо бажана якість не запускається, автоматично перевіряє нижчу. Обов’язкова українська та ліміт розміру зберігаються' }
         });
 
         Lampa.SettingsApi.addParam({
@@ -1377,13 +1620,30 @@
         Lampa.SettingsApi.addParam({
             component: 'best_quality',
             param: { name: STORE.warm, type: 'trigger', default: true },
-            field: { name: 'Буферизація перед стартом', description: 'Чекати наповнення кешу TorrServe, щоб уникнути фризів на початку' }
+            field: { name: 'Буферизація перед стартом', description: 'До 12 секунд попереднього завантаження. Зменшує ризик пауз на початку' }
         });
 
         Lampa.SettingsApi.addParam({
             component: 'best_quality',
-            param: { name: STORE.seeds, type: 'input', values: '', default: '1' },
-            field: { name: 'Мінімум сідів' }
+            param: { name: STORE.seeds, type: 'input', values: '', default: '1', placeholder: '1' },
+            field: { name: 'Бажаний мінімум сідів', description: 'Кількість у парсері може застаріти. За потреби перевіряє й роздачі з меншою кількістю' }
+        });
+        Lampa.SettingsApi.addParam({ component: 'best_quality', param: { name: 'bq_last_report', type: 'button' },
+            field: { name: 'Остання перевірка', description: 'Стан пошуку, кількість кандидатів і причини відмов' },
+            onRender: function (item) { item.on('hover:enter', function () {
+                var names = { language: 'Мова', hdr: 'HDR/DV', size: 'Розмір', link: 'Немає посилання', cam: 'Екранка',
+                    '3d': '3D', series: 'Серіал замість фільму', metadata: 'Метадані / сезон / файли', playback: 'Плеєр / аудіодоріжка', server: 'TorrServe', parser: 'Парсер' };
+                var items = [{ title: escapeText(lastReport.status) },
+                    { title: 'Знайдено: ' + lastReport.found + '; кандидатів: ' + lastReport.candidates + '; спроб: ' + lastReport.tried }];
+                Object.keys(lastReport.reasons).forEach(function (key) { items.push({ title: (names[key] || key) + ': ' + lastReport.reasons[key] }); });
+                if (lastReport.lastFailure) items.push({ title: escapeText(lastReport.lastFailure) });
+                Lampa.Select.show({ title: 'Перевірка · v' + BQ_VERSION, items: items, onSelect: function () {},
+                    onBack: function () { Lampa.Controller.toggle('settings_component'); } });
+            }); }
+        });
+        Lampa.SettingsApi.addParam({ component: 'best_quality', param: { name: 'bq_cancel', type: 'button' },
+            field: { name: 'Зупинити автоматичний пошук' },
+            onRender: function (item) { item.on('hover:enter', function () { beginOperation(); report('Автоматичний пошук зупинено'); }); }
         });
     }
 
@@ -1401,7 +1661,7 @@
             title: 'Дивитись далі',
             items: items.map(function (e) {
                 return {
-                    title: (e.card.title || e.card.name) + ' · ' + (e.epTitle || ('сезон ' + e.season)),
+                    title: escapeText((e.card.title || e.card.name) + ' · ' + (e.epTitle || ('сезон ' + e.season))),
                     entry: e
                 };
             }),
@@ -1414,6 +1674,7 @@
     }
 
     function addMenuItem(attempt) {
+        if (window.bq_version !== BQ_VERSION) return;
         attempt = attempt || 0;
 
         var list = $('.menu .menu__list').eq(0);
@@ -1424,7 +1685,10 @@
             return;
         }
 
-        if (list.find('[data-action="bq_continue"]').length) return;
+        if (list.find('[data-action="bq_continue"]').length) {
+            list.find('[data-action="bq_continue"]').off('hover:enter').on('hover:enter', showContinueList);
+            return;
+        }
 
         var icon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>';
 
@@ -1440,6 +1704,8 @@
     /* ---------- Старт ---------- */
 
     var started = false;
+    function onFull(e) { if (e.type === 'complite') addButton(e); }
+    function onApp(e) { if (e.type === 'ready') start(); }
     function start() {
         if (started || window.bq_version !== BQ_VERSION) return;
         started = true;
@@ -1447,14 +1713,10 @@
         addSettings();
         addDeviceSettings();
         addMenuItem();
-        Lampa.Listener.follow('full', function (e) {
-            if (e.type === 'complite') addButton(e);
-        });
+        Lampa.Listener.follow('full', onFull);
         Lampa.Noty.show('«Дивитись» v' + BQ_VERSION + ' активний');
     }
 
     if (window.appready) start();
-    else Lampa.Listener.follow('app', function (e) {
-        if (e.type === 'ready') start();
-    });
+    else Lampa.Listener.follow('app', onApp);
 })();
