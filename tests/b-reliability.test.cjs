@@ -51,12 +51,13 @@ function fixture() {
     const exposure = `window.__test = {
         seasonsOfText, extractSeasons, filterBySeason, filesForSeason, isSeriesCard,
         releaseLanguages, scoreRelease, sizeLimit, hdrMode, codecPreference, addSettings,
-        playInTorrserve, waitFiles, warmUp, findBest, pick, episodeOf, contAll, contGet, contSave, resumeSaved,
+        playInTorrserve, waitFiles, warmUp, probeStream, findBest, pick, episodeOf, contAll, contGet, contSave, resumeSaved,
         request: tsApi, parser: search, checkServerConnection, browserProfile, tvMode, voiceMode, mediaText,
         report: function () { return lastReport; },
         state: function (series, season, max) { curIsSeries = series; curSeason = season; curMaxSeason = max || 0; },
         cancel: beginOperation,
-        hooks: function (api, warm, parser) {
+        hooks: function (api, warm, parser, probe) {
+            if (probe) probeStream = probe;
             if (api) tsApi = api;
             if (warm) warmUp = warm;
             if (parser) search = parser;
@@ -64,7 +65,7 @@ function fixture() {
     };`;
     vm.runInContext(source.replace('    if (window.appready) start();', exposure + '\n    if (window.appready) start();'), context);
     const api = window.__test;
-    api.hooks((body, done, fail) => requests.push({ body, done, fail }));
+    api.hooks((body, done, fail) => requests.push({ body, done, fail }), null, null, (url,done)=>done());
     return { api, window, context, storage, params, notices, plays, requests,
         selection: () => selection, playlist: () => playlist, playerEvents, videoEvents,
         tick(ms) {
@@ -200,9 +201,9 @@ test('buffer deadline is independent of a stalled status request', () => {
     let starts = 0, aborts = 0;
     f.context.XMLHttpRequest = function () { this.open = this.send = () => {}; this.abort = () => aborts++; };
     f.api.warmUp('fixture', 'http://server.invalid/stream?fixture', () => starts++);
-    f.tick(12000); assert.equal(starts, 1); assert.equal(aborts, 1);
+    f.tick(12000); assert.equal(starts, 0); assert.equal(aborts, 1);
     f.requests.shift().done({ preloaded_bytes: 100, preload_size: 100 });
-    f.tick(30000); assert.equal(starts, 1);
+    f.tick(30000); assert.equal(starts, 0);
 });
 test('strict Russian excludes unknown audio and Russian subtitles', () => {
     const f = fixture(); f.storage.bq_voice = 'rus'; f.api.state(true, 1);
@@ -639,14 +640,14 @@ test('TorrServe timeout retries once and a later success settles normally',()=>{
 test('metadata deadline aborts a pending reconnect without stale callbacks',()=>{
     const f=fixture(),calls=xhrMock(f),errors=[];f.api.hooks(f.api.request);
     f.api.waitFiles('synthetic',()=>assert.fail('success'),e=>errors.push(e));
-    f.tick(15000);calls[0].ontimeout();f.tick(800);f.tick(4200);
+    f.tick(1000);calls[0].onerror();f.tick(800);f.tick(10200);
     assert(calls[1].aborted);assert.equal(errors.length,1);f.tick(60000);assert.equal(calls.length,2);
 });
-test('buffer deadline cancels a pending status reconnect before launching',()=>{
+test('buffer deadline cancels a pending status reconnect without launching',()=>{
     const f=fixture(),calls=xhrMock(f);f.storage.bq_warm=true;f.api.hooks(f.api.request);let ready=0;
     f.api.warmUp('synthetic','http://server.invalid/stream?link=synthetic&play',()=>ready++);
     calls[1].onerror();f.tick(800);assert.equal(calls.length,3);f.tick(11200);
-    assert(calls[0].aborted);assert(calls[2].aborted);assert.equal(ready,1);f.tick(60000);assert.equal(calls.length,3);
+    assert(calls[0].aborted);assert(calls[2].aborted);assert.equal(ready,0);f.tick(60000);assert.equal(calls.length,3);
 });
 test('fallback server selection respects the configured second address',()=>{
     const f=fixture(),calls=xhrMock(f);f.context.Lampa.Torserver.url=()=>'';
@@ -749,4 +750,61 @@ test('cancelling preload immediately aborts it and never starts playback',()=>{
 test('legacy and invalid select values migrate to visible supported options',()=>{
     const f=fixture();f.storage.bq_voice=true;f.storage.bq_codec='invalid';f.storage.bq_hdr='undefined';f.storage.bq_maxgb='bad';
     f.api.addSettings();assert.equal(f.storage.bq_voice,'ukr');assert.equal(f.storage.bq_codec,'auto');assert.equal(f.storage.bq_hdr,'auto');assert.equal(f.storage.bq_maxgb,'auto');
+});
+
+for (const mode of ['bytes', 'full-response', 'empty', 'html', 'http', 'timeout', 'network', 'cancel']) test('selected stream preflight: '+mode,()=>{
+    const f=fixture(),calls=xhrMock(f);let ready=0;const errors=[];
+    f.api.probeStream('http://server.invalid/stream/file?link=x&index=3&play',()=>ready++,e=>errors.push(e));
+    const x=calls[0];assert.equal(x.headers.Range,'bytes=0-65535');assert.match(x.url,/index=3/);
+    x.status=mode==='http'?404:mode==='full-response'?200:206;
+    x.getResponseHeader=()=>mode==='html'?'text/html':'video/x-matroska';
+    if(mode==='cancel')f.api.cancel();
+    else if(mode==='timeout')f.tick(8000);
+    else if(mode==='network'){x.onerror();calls[1].onerror();}
+    else if(mode==='empty'){x.response={byteLength:0};x.onload();}
+    else x.onprogress({loaded:65536});
+    assert.equal(ready,['bytes','full-response'].includes(mode)?1:0);
+    assert.equal(errors.length,['bytes','full-response','cancel'].includes(mode)?0:1);
+    assert(x.aborted);x.onprogress({loaded:65536});f.tick(30000);
+    assert.equal(ready,['bytes','full-response'].includes(mode)?1:0);
+});
+test('disabled buffering still checks bytes before handing off',()=>{
+    const f=fixture(),calls=xhrMock(f);f.api.hooks(null,null,null,f.api.probeStream);let ready=0;
+    f.api.warmUp('x','http://server.invalid/stream?index=2&play',()=>ready++,()=>assert.fail('unexpected failure'));
+    assert.equal(ready,0);const x=calls[0];x.status=206;x.getResponseHeader=()=>'';x.response={byteLength:4096};x.onload();assert.equal(ready,1);
+});
+test('preflight supplies configured authentication',()=>{
+    const f=fixture(),calls=xhrMock(f);f.storage.torrserver_auth=true;f.storage.torrserver_login='user';f.storage.torrserver_password='pass';
+    f.api.probeStream('http://server.invalid/stream?index=1',()=>{},()=>{});
+    assert.equal(calls[0].headers.Authorization,'Basic '+Buffer.from('user:pass').toString('base64'));f.api.cancel();
+});
+test('failed stream preserves the selected episode for automatic retry',()=>{
+    const f=fixture();let retry,why;f.api.state(true,2);f.api.hooks(null,null,null,(url,done,fail)=>fail({reason:'stream',message:'No bytes'}));
+    f.api.playInTorrserve(release('Example S02','synthetic'),{name:'Example'},(opts,error)=>{retry=opts;why=error;},{episode:4,position:25});
+    f.requests.shift().done({hash:'synthetic'});
+    f.requests.shift().done({file_stats:[{path:'Example.S02E04.mkv',id:7,length:100}]});
+    assert.equal(f.plays.length,0);assert.equal(retry.episode,4);assert.equal(retry.season,2);assert.equal(retry.position,25);assert.equal(why.reason,'stream');
+});
+test('stalled buffering fails once instead of launching the Android player',()=>{
+    const f=fixture();xhrMock(f);f.storage.bq_warm=true;let ready=0;const errors=[];
+    f.api.warmUp('x','http://server.invalid/stream?play',()=>ready++,e=>errors.push(e));
+    for(let n=0;n<5;n++){f.requests.shift().done({preloaded_bytes:0,preload_size:100});f.tick(1500);}
+    assert.equal(ready,0);assert.equal(errors.length,1);assert.equal(errors[0].reason,'stream');f.tick(30000);assert.equal(errors.length,1);
+});
+test('metadata deadline stops at twelve seconds',()=>{
+    const f=fixture();let errors=0;f.api.waitFiles('x',()=>assert.fail('unexpected files'),()=>errors++);
+    f.tick(11999);assert.equal(errors,0);f.tick(1);assert.equal(errors,1);
+});
+test('older WebView range rejection falls back once with the original deadline',()=>{
+    const f=fixture(),calls=xhrMock(f);let ready=0;const errors=[];
+    f.api.probeStream('http://server.invalid/stream?index=9&play',()=>ready++,e=>errors.push(e));
+    f.tick(7000);calls[0].onerror();assert.equal(calls.length,2);assert.equal(calls[1].headers.Range,undefined);
+    calls[0].onerror();assert.equal(calls.length,2);
+    f.tick(1000);assert.equal(errors.length,1);assert(calls[1].aborted);assert.equal(ready,0);
+});
+test('plain GET fallback aborts immediately after data arrives',()=>{
+    const f=fixture(),calls=xhrMock(f);let ready=0;
+    f.api.probeStream('http://server.invalid/stream?index=9&play',()=>ready++,()=>assert.fail('unexpected failure'));
+    calls[0].onerror();const x=calls[1];x.status=200;x.getResponseHeader=()=> 'application/octet-stream';x.onprogress({loaded:8192});
+    assert.equal(ready,1);assert(x.aborted);f.tick(30000);assert.equal(ready,1);
 });

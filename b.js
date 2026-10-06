@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 40;
+    var BQ_VERSION = 41;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -835,7 +835,7 @@
     // Чекаємо, поки торрент підтягне метадані і віддасть список файлів
     function waitFiles(hash, done, fail) {
         var requestId = operation, finished = false, next, cancelRequest;
-        var deadline = setTimeout(function () { finish(null, 'Метадані не отримано за 20 с'); }, 20000);
+        var deadline = setTimeout(function () { finish(null, 'Метадані не отримано за 12 с'); }, 12000);
         var untrack = trackRequest(function () { finish(null, 'Скасовано'); });
         function finish(files, error) {
             if (finished) return;
@@ -1006,14 +1006,74 @@
 
     /* ---------- 3б. Буферизація перед стартом ---------- */
 
-    function warmUp(hash, streamUrl, done) {
+    // Read only a small range from the exact selected file. HTTP connectivity and
+    // torrent-wide cache counters alone do not prove that this file delivers bytes.
+    function probeStream(url, done, fail) {
+        var id = operation, finished = false, xhr;
+        var timer = setTimeout(function () { finish('Потік не віддав дані за 8 с'); }, 8000);
+        var untrack = trackRequest(function () { finish('Скасовано'); });
+        function finish(error) {
+            if (finished) return;
+            finished = true;
+            clearTimeout(timer); untrack();
+            try { xhr.abort(); } catch (e) {}
+            if (!current(id)) return;
+            if (error) fail({ message: error, reason: 'stream' }); else done();
+        }
+        function received(bytes) {
+            if (finished) return;
+            var type = String(xhr.getResponseHeader('Content-Type') || '').toLowerCase();
+            if (xhr.status !== 200 && xhr.status !== 206) return finish('Потік: HTTP ' + xhr.status);
+            if (/text\/|json|xml|mpegurl/.test(type)) return finish('Сервер повернув відповідь без відеоданих');
+            if (bytes > 0) finish();
+        }
+        showProgress('Перевіряю надходження відеоданих…');
+        function send(useRange) {
+            if (finished) return;
+            try {
+                var request = new XMLHttpRequest();
+                xhr = request;
+                request.open('GET', url, true);
+                request.responseType = 'arraybuffer';
+                // Older WebViews preflight Range, which some TorrServe versions
+                // do not allow. One plain GET fallback shares the same deadline
+                // and is aborted as soon as the first bytes arrive.
+                if (useRange) request.setRequestHeader('Range', 'bytes=0-65535');
+                var auth = Lampa.Storage.get('torrserver_auth', false);
+                if (auth === true || auth === 'true') {
+                    var login = Lampa.Storage.get('torrserver_login', '');
+                    var pass = Lampa.Storage.get('torrserver_password', '');
+                    request.setRequestHeader('Authorization', 'Basic ' + btoa(unescape(encodeURIComponent(login + ':' + pass))));
+                }
+                request.timeout = 8000;
+                request.onprogress = function (event) { if (xhr === request) received(event.loaded); };
+                request.onload = function () {
+                    if (finished || xhr !== request) return;
+                    received(request.response && request.response.byteLength || 0);
+                    if (!finished) finish('Потік повернув порожню відповідь');
+                };
+                request.onerror = function () {
+                    if (finished || xhr !== request) return;
+                    if (useRange) { request.abort(); send(false); }
+                    else finish('Не вдалося прочитати відеопотік');
+                };
+                request.ontimeout = function () { if (xhr === request) finish('Потік не віддав дані за 8 с'); };
+                request.send();
+            } catch (e) { finish('Не вдалося перевірити відеопотік'); }
+        }
+        send(true);
+    }
+
+    function warmUp(hash, streamUrl, done, fail) {
+        fail = fail || function () {};
+        function ready() { probeStream(streamUrl, done, fail); }
         var w = cfg('warm', 'true');
-        if (!(w === true || w === 'true')) return done();
+        if (!(w === true || w === 'true')) return ready();
 
         var finished = false, requestId = operation, cancelRequest, next;
         var t0 = Date.now();
         var lastPre = -1, stallAt = Date.now();
-        var deadline = setTimeout(finish, 12000);
+        var deadline = setTimeout(function () { finish('Буфер не підготовлено за 12 с'); }, 12000);
         var untrack = trackRequest(finish);
 
         // Штовхаємо TorrServe качати з цієї позиції
@@ -1026,7 +1086,7 @@
             xhr.send();
         } catch (e) {}
 
-        function finish() {
+        function finish(error) {
             if (finished) return;
             finished = true;
             clearTimeout(deadline);
@@ -1034,14 +1094,17 @@
             if (typeof cancelRequest === 'function') cancelRequest();
             untrack();
             try { xhr.abort(); } catch (e) {}
-            if (current(requestId)) done();
+            if (current(requestId)) {
+                if (error) fail(typeof error === 'object' ? error : { message: error, reason: 'stream' });
+                else ready();
+            }
         }
 
         (function poll() {
             if (finished) return;
             if (!current(requestId)) return finish();
-            // Жорстка стеля 12 с — краще легкий фриз на старті, ніж довге чекання
-            if (Date.now() - t0 > 12000) return finish();
+            // An unready stream must not be handed to an unobservable Android player.
+            if (Date.now() - t0 > 12000) return finish('Буфер не підготовлено за 12 с');
 
             cancelRequest = tsApi({ action: 'get', hash: hash }, function (t) {
                 if (finished) return;
@@ -1049,7 +1112,7 @@
                 var pre = t && t.preloaded_bytes, size = t && t.preload_size;
 
                 if (pre === undefined || !size) {
-                    // TorrServe без полів прогресу — 3 с фори і стартуємо
+                    // Older servers: check the selected stream directly instead of assuming readiness.
                     if (Date.now() - t0 > 3000) return finish();
                 }
                 else {
@@ -1059,9 +1122,9 @@
                     // 50% буфера достатньо для гладкого старту
                     if (pct >= 50) return finish();
 
-                    // Буфер не росте 5 с (мало сідів) — не мучимо людину
+                    // A stalled cache is a candidate failure, not playback success.
                     if (pre > lastPre) { lastPre = pre; stallAt = Date.now(); }
-                    else if (Date.now() - stallAt > 5000) return finish();
+                    else if (Date.now() - stallAt > 5000) return finish('Буфер не зростає — перевіряю інший реліз');
                 }
 
                 next = setTimeout(poll, 1500);
@@ -1290,6 +1353,8 @@
                             if (audioGuardCleanup) audioGuardCleanup();
                             reject('Не вдалося запустити плеєр', { season: season, episode: data.bq_episode, path: data.path, hash: hash });
                         }
+                    }, function (error) {
+                        reject(error, { season: season, episode: data.bq_episode, path: data.path, hash: hash, position: opts.position });
                     });
                 }
                 // Across releases an episode number is stable; its array index is not.
@@ -1730,7 +1795,7 @@
         Lampa.SettingsApi.addParam({
             component: 'best_quality',
             param: { name: STORE.warm, type: 'trigger', default: true },
-            field: { name: 'Буферизація перед стартом', description: 'До 12 секунд попереднього завантаження. Зменшує ризик пауз на початку' }
+            field: { name: 'Буферизація перед стартом', description: 'До 12 секунд буферизації. Перевірка надходження відеоданих працює також при вимкненій буферизації' }
         });
 
         Lampa.SettingsApi.addParam({
@@ -1742,7 +1807,7 @@
             field: { name: 'Остання перевірка', description: 'Стан пошуку, кількість кандидатів і причини відмов' },
             onRender: function (item) { item.on('hover:enter', function () {
                 var names = { language: 'Мова', hdr: 'HDR/DV', size: 'Розмір', link: 'Немає посилання', cam: 'Екранка',
-                    '3d': '3D', series: 'Серіал замість фільму', metadata: 'Метадані / сезон / файли', playback: 'Плеєр / аудіодоріжка', server: 'TorrServe', parser: 'Парсер' };
+                    '3d': '3D', series: 'Серіал замість фільму', metadata: 'Метадані / сезон / файли', playback: 'Плеєр / аудіодоріжка', stream: 'Готовність відеопотоку', server: 'TorrServe', parser: 'Парсер' };
                 var items = [{ title: escapeText(lastReport.status) },
                     { title: 'Знайдено: ' + lastReport.found + '; кандидатів: ' + lastReport.candidates + '; спроб: ' + lastReport.tried }];
                 if (lastReport.release) items.push({ title: escapeText(lastReport.release) });

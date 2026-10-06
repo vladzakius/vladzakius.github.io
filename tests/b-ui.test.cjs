@@ -86,8 +86,9 @@ function playbackFlow(warm = false) {
     f.w.Lampa.Torserver.url=()=> 'http://server.invalid';
     f.w.Lampa.Timeline={view:hash=>({hash,time:0})};
     f.w.XMLHttpRequest=function(){
-        http.push(this);this.open=(method,url)=>{this.method=method;this.url=url;};this.setRequestHeader=()=>{};
-        this.send=()=>{};this.abort=()=>{this.aborted=true;};
+        http.push(this);this.open=(method,url)=>{this.method=method;this.url=url;};this.setRequestHeader=(key)=>{if(key==='Range')this.probe=true;};
+        this.getResponseHeader=()=>'video/x-matroska';
+        this.send=()=>{if(this.probe){http.splice(http.indexOf(this),1);this.status=206;this.response={byteLength:65536};this.onload();}};this.abort=()=>{this.aborted=true;};
     };
     Object.assign(f.w.Lampa.Player,{
         play(data){f.w.Lampa.Player.listener.send('create',{data});active=data;plays.push(data);f.w.Lampa.Player.listener.send('ready',data);},
@@ -110,11 +111,11 @@ test('preparation status persists across long search, server, file and player ph
     assert.equal(f.$('.bq-progress').length,1);assert.equal(f.$('.bq-progress__time').text(),'20 с');
     f.progress();assert.equal(f.$('.bq-progress').length,0);f.tick(5000);assert.equal(f.$('.bq-progress').length,0);f.dom.window.close();
 });
-test('buffer progress remains visible and a delayed status request is aborted at launch',()=>{
+test('buffer progress remains visible until readiness and preload is aborted at launch',()=>{
     const f=playbackFlow(true);f.result();f.respond(0,{hash:'synthetic'});f.respond(1,{file_stats:[{path:'Movie.mkv',id:1}]});
     f.respond(3,{preloaded_bytes:13,preload_size:100});f.tick(5000);
     assert.match(f.$('.bq-progress__text').text(),/Буферизація 13%/);assert.equal(f.plays.length,0);
-    f.tick(7000);assert.equal(f.plays.length,1);assert(f.http[4].aborted);
+    f.respond(4,{preloaded_bytes:60,preload_size:100});assert.equal(f.plays.length,1);assert(f.http[2].aborted);
     assert.match(f.$('.bq-progress__text').text(),/Запускаю/);f.progress();assert.equal(f.$('.bq-progress').length,0);f.dom.window.close();
 });
 test('reconnect status resumes the original phase after successful retry',()=>{
