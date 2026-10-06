@@ -204,24 +204,25 @@ test('buffer deadline is independent of a stalled status request', () => {
     f.requests.shift().done({ preloaded_bytes: 100, preload_size: 100 });
     f.tick(30000); assert.equal(starts, 1);
 });
-test('Russian preference treats Russian subtitles as unknown but stays automatic', () => {
+test('strict Russian excludes unknown audio and Russian subtitles', () => {
     const f = fixture(); f.storage.bq_voice = 'rus'; f.api.state(true, 1);
     f.api.pick([{ Title: 'Example S01 Original + Rus Sub', Link: 'https://fixture.invalid/data', Seeders: 10 }], { title: 'Example' });
-    assert.equal(f.requests.length, 1);
-    assert.equal(f.requests[0].body.link, 'https://fixture.invalid/data');
+    assert.equal(f.requests.length, 0);
+    assert.match(f.notices.at(-1), /староукраїнську озвучку/);
 });
-test('language preference orders candidates but keeps automatic fallbacks', () => {
+test('strict Russian retries Russian candidates without Ukrainian or unknown fallbacks', () => {
     const f = fixture(); f.storage.bq_voice = 'rus'; f.api.state(true, 1);
     f.api.pick([
         { Title: 'Example S01 1080p UKR', Link: 'ukr', Seeders: 90 },
         { Title: 'Example S01 1080p', Link: 'unknown', Seeders: 80 },
-        { Title: 'Example S01 720p RUS', Link: 'rus', Seeders: 2 }
+        { Title: 'Example S01 720p RUS', Link: 'rus', Seeders: 2 },
+        { Title: 'Example S01 480p RUS', Link: 'rus2', Seeders: 1 }
     ], { title: 'Example' });
     assert.equal(f.requests[0].body.link, 'rus');
     f.requests.shift().fail('fixture');
-    assert.equal(f.requests[0].body.link, 'unknown');
+    assert.equal(f.requests[0].body.link, 'rus2');
     f.requests.shift().fail('fixture');
-    assert.equal(f.requests[0].body.link, 'ukr');
+    assert.equal(f.requests.length, 0);
 });
 test('player receives torrent context and fatal startup error advances candidate', () => {
     const f = fixture(); f.api.state(false, 0);
@@ -519,7 +520,7 @@ test('search deduplicates infohash across trackers while merging seeds and ffpro
         release('Example S01','second',{Guid:'tracker2',InfoHash:hash.toUpperCase(),Seeders:80,ffprobe:[{codec_type:'audio',tags:{language:'rus'}}]})
     ]));
     f.api.findBest(card); assert.equal(f.api.report().found,1); assert.equal(f.api.report().candidates,1);
-    assert.match(f.notices.at(-1),/80 сідів/);
+    assert(f.notices.some(text=>/80 сідів/.test(text)));
 });
 test('search obtains both Ukrainian and Russian title variants', () => {
     const f=fixture(), queries=[];
@@ -554,6 +555,113 @@ function xhrMock(f) {
     };
     return calls;
 }
+
+test('Russian selection enables RUS instead of the default Ukrainian track', () => {
+    const f = fixture(); f.storage.bq_voice = 'rus';
+    f.api.playInTorrserve(release('Example RUS + UKR'), {title:'Example'}, () => assert.fail('rejected'));
+    filesReady(f, ['Movie.mkv']);
+    const tracks = [{language:'ukr', enabled:true}, {language:'rus', enabled:false}];
+    f.videoEvents.send('tracks', {tracks});
+    assert.equal(tracks[0].enabled, false); assert.equal(tracks[1].enabled, true);
+});
+test('UKR and ENG only tracks cannot pass strict Russian even with a misleading title', () => {
+    const f = fixture(); f.storage.bq_voice='rus'; f.api.state(true,2);
+    f.api.pick([release('Example S02 RUS 1080p','wrong'), release('Example S02 RUS 720p','next')], card, {season:2,episode:1});
+    filesReady(f, ['Show.S02E01.[Toloka].mkv']);
+    f.videoEvents.send('tracks', {tracks:[{language:'ukr',enabled:true},{language:'eng'}]});
+    f.tick(250);
+    assert.equal(f.requests[0].body.link,'next'); assert.equal(f.api.contGet(card),null);
+    filesReady(f, ['Show.S02E01.mkv','Show.S02E02.mkv']);
+    assert.match(f.plays.at(-1).path,/S02E01/); assert.equal(f.selection(),undefined);
+});
+test('changing to Russian re-searches saved Ukrainian release and keeps episode and time', () => {
+    const f = fixture(); f.storage.bq_voice='rus';
+    f.api.hooks(null,null,(query,done)=>done([release('Example S02 UKR','ukr'),release('Example S02 RUS','rus')]));
+    f.api.resumeSaved({card,season:2,episode:3,epTitle:'Show.S02E03',link:'saved-ukr',languages:{ukr:true,rus:false},position:83});
+    assert.equal(f.requests[0].body.link,'rus');
+    filesReady(f,['Show.S02E01.mkv','Show.S02E03.mkv']);
+    assert.match(f.plays[0].path,/S02E03/); assert.equal(f.plays[0].timeline.time,83);
+    assert.equal(f.selection(),undefined);
+});
+test('matching saved Russian release resumes without another search', () => {
+    const f=fixture();f.storage.bq_voice='rus';f.api.hooks(null,null,()=>assert.fail('unnecessary search'));
+    f.api.resumeSaved({card,season:1,episode:1,epTitle:'Show.S01E01',link:'saved-rus',languages:{rus:true},position:21});
+    assert.equal(f.requests[0].body.link,'saved-rus');filesReady(f,['Show.S01E01.mkv']);assert.equal(f.plays[0].timeline.time,21);
+});
+test('history uses reported file languages instead of misleading release metadata', () => {
+    const f=fixture();f.api.state(true,1);
+    f.api.playInTorrserve(release('Example S01 RUS','wrong-metadata'),card,()=>assert.fail('rejected'));
+    filesReady(f,['Show.S01E01.mkv']);
+    f.videoEvents.send('tracks',{tracks:[{language:'ukr'},{language:'eng'}]});progress(f);
+    assert.deepEqual(plain(f.api.contGet(card).languages),{ukr:true,rus:false});
+});
+test('voice setting renames both Russian labels and preserves stored selection',()=>{
+    const f=fixture();f.storage.bq_voice='rus';f.api.addSettings();
+    const values=f.params.find(p=>p.param.name==='bq_voice').param.values;
+    assert.equal(f.storage.bq_voice,'rus');assert.equal(values.rus,'Староукраїнська');
+    assert.equal(values.ukr_rus,'Українська → староукраїнська');
+    assert(!Object.values(values).some(label=>/російська/i.test(label)));
+});
+for(const action of ['add','get']) test('temporary TorrServe network failure retries the same '+action+' once',()=>{
+    const f=fixture(),calls=xhrMock(f);let result, failures=0;
+    const body=action==='add'?{action,link:'synthetic',save_to_db:false}:{action,hash:'synthetic'};
+    f.api.request(body,data=>{result=data;},()=>failures++);
+    calls[0].onerror();calls[0].ontimeout();f.tick(799);assert.equal(calls.length,1);f.tick(1);
+    assert.equal(calls.length,2);assert.equal(calls[1].url,calls[0].url);assert.equal(calls[1].body,calls[0].body);
+    calls[1].status=200;calls[1].responseText='{"hash":"synthetic"}';calls[1].onload();
+    calls[0].status=200;calls[0].responseText='{"hash":"stale"}';calls[0].onload();
+    f.tick(60000);assert.equal(calls.length,2);assert.equal(failures,0);assert.equal(result.hash,'synthetic');
+});
+for(const status of [0,502,503,504]) test('TorrServe HTTP '+status+' recovery is bounded and terminal after retry',()=>{
+    const f=fixture(),calls=xhrMock(f),errors=[];
+    f.api.request({action:'get',hash:'synthetic'},()=>assert.fail('success'),e=>errors.push(e));
+    calls[0].status=status;calls[0].onload();f.tick(800);assert.equal(calls.length,2);
+    calls[1].status=status;calls[1].onload();f.tick(60000);
+    assert.equal(errors.length,1);assert.equal(errors[0].terminal,true);assert.equal(calls.length,2);
+    assert.match(errors[0].message,/після повторної спроби/);
+});
+test('cancelling between reconnect attempts suppresses retries and callbacks',()=>{
+    const f=fixture(),calls=xhrMock(f);let results=0;
+    f.api.request({action:'get'},()=>results++,()=>results++);calls[0].onerror();f.api.cancel();f.tick(60000);
+    assert.equal(calls.length,1);assert.equal(results,0);
+});
+test('cancelling an active reconnect aborts the second request',()=>{
+    const f=fixture(),calls=xhrMock(f);let results=0;
+    f.api.request({action:'get'},()=>results++,()=>results++);calls[0].onerror();f.tick(800);
+    f.api.cancel();calls[1].onerror();assert(calls[1].aborted);assert.equal(results,0);
+});
+test('TorrServe timeout retries once and a later success settles normally',()=>{
+    const f=fixture(),calls=xhrMock(f);let successes=0;
+    f.api.request({action:'get'},()=>successes++,()=>assert.fail('failed'));
+    f.tick(15000);calls[0].ontimeout();f.tick(800);
+    calls[1].status=200;calls[1].responseText='{}';calls[1].onload();assert.equal(successes,1);
+});
+test('metadata deadline aborts a pending reconnect without stale callbacks',()=>{
+    const f=fixture(),calls=xhrMock(f),errors=[];f.api.hooks(f.api.request);
+    f.api.waitFiles('synthetic',()=>assert.fail('success'),e=>errors.push(e));
+    f.tick(15000);calls[0].ontimeout();f.tick(800);f.tick(4200);
+    assert(calls[1].aborted);assert.equal(errors.length,1);f.tick(60000);assert.equal(calls.length,2);
+});
+test('buffer deadline cancels a pending status reconnect before launching',()=>{
+    const f=fixture(),calls=xhrMock(f);f.storage.bq_warm=true;f.api.hooks(f.api.request);let ready=0;
+    f.api.warmUp('synthetic','http://server.invalid/stream?link=synthetic&play',()=>ready++);
+    calls[1].onerror();f.tick(800);assert.equal(calls.length,3);f.tick(11200);
+    assert(calls[0].aborted);assert(calls[2].aborted);assert.equal(ready,1);f.tick(60000);assert.equal(calls.length,3);
+});
+test('fallback server selection respects the configured second address',()=>{
+    const f=fixture(),calls=xhrMock(f);f.context.Lampa.Torserver.url=()=>'';
+    f.storage.torrserver_url='first.invalid:8090';f.storage.torrserver_url_two='second.invalid:8090/';f.storage.torrserver_use_link='two';
+    f.api.request({action:'get'},()=>{},()=>{});assert.equal(calls[0].url,'http://second.invalid:8090/torrents');
+});
+test('requests and stream stay on one server until the next operation',()=>{
+    const f=fixture(),calls=xhrMock(f);let address='http://first.invalid';f.context.Lampa.Torserver.url=()=>address;f.api.hooks(f.api.request);
+    f.api.playInTorrserve(release('Example','synthetic'),{title:'Example'},()=>assert.fail('rejected'));
+    address='http://second.invalid';calls[0].status=200;calls[0].responseText='{"hash":"synthetic"}';calls[0].onload();
+    assert.equal(calls[1].url,'http://first.invalid/torrents');
+    calls[1].status=200;calls[1].responseText='{"file_stats":[{"id":1,"path":"Movie.mkv"}]}';calls[1].onload();
+    assert.match(f.plays[0].url,/^http:\/\/first.invalid\/stream\//);
+    f.api.cancel();f.api.request({action:'get'},()=>{},()=>{});assert.equal(calls[2].url,'http://second.invalid/torrents');
+});
 for (const [status, terminal] of [[401,true],[403,true],[404,true],[500,false]]) test('TorrServe API classifies HTTP '+status,()=>{
     const f=fixture(), calls=xhrMock(f), failures=[];
     f.api.request({action:'get',hash:'synthetic'},()=>assert.fail('unexpected success'),error=>failures.push(error));

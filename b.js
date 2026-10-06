@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 39;
+    var BQ_VERSION = 40;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -37,15 +37,19 @@
     var operation = 0;
     var audioGuardCleanup = null;
     var requestsToCancel = [];
+    var serverAddress = '';
+    var progressState = null, progressTimer, progressElement = null;
     var lastReport = { status: 'Ще не запускали пошук', found: 0, candidates: 0, tried: 0, reasons: {} };
 
     function current(id) { return id === operation && window.bq_version === BQ_VERSION; }
     function beginOperation() {
         operation++;
+        stopProgress();
         if (audioGuardCleanup) audioGuardCleanup();
         var pending = requestsToCancel;
         requestsToCancel = [];
         pending.forEach(function (cancel) { try { cancel(); } catch (e) {} });
+        serverAddress = '';
         return operation;
     }
     function trackRequest(cancel) {
@@ -56,9 +60,51 @@
         };
     }
     function report(message, reason) {
+        stopProgress();
         lastReport.status = message;
         if (reason) lastReport.reasons[reason] = (lastReport.reasons[reason] || 0) + 1;
         Lampa.Noty.show(message);
+    }
+
+    // Keep preparation visible without changing notifications owned by Lampa.
+    function stopProgress() {
+        clearTimeout(progressTimer);
+        progressState = null;
+        if (progressElement) { progressElement.remove(); progressElement = null; }
+    }
+    function showProgress(message) {
+        if (!progressState) progressState = { id: operation, since: Date.now(), message: '' };
+        progressState.message = message;
+        lastReport.status = message;
+        clearTimeout(progressTimer);
+        function render() {
+            if (!progressState || !current(progressState.id)) return stopProgress();
+            if (typeof $ === 'function' && document.body) {
+                if (!progressElement) {
+                    if (!document.getElementById('bq-progress-style')) {
+                        $('<style id="bq-progress-style">' +
+                            '.bq-progress{position:fixed;z-index:10000;left:3%;right:3%;bottom:1em;bottom:calc(1em + env(safe-area-inset-bottom,0px));' +
+                            'display:flex;align-items:center;padding:.8em 1em;border-radius:.6em;background:#203630;color:#fff;' +
+                            'box-shadow:0 2px 12px #0008;font-size:1em;line-height:1.3;pointer-events:none;}' +
+                            '.bq-progress__text{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}' +
+                            '.bq-progress__time{margin-left:1em;white-space:nowrap;opacity:.8;}' +
+                            '.bq-progress__spinner{width:1em;height:1em;flex:none;margin-right:.7em;border:2px solid #ffffff50;' +
+                            'border-top-color:#63efb7;border-radius:50%;animation:bq-spin 1s linear infinite;}' +
+                            '@keyframes bq-spin{to{transform:rotate(360deg)}}' +
+                            '@media(prefers-reduced-motion:reduce){.bq-progress__spinner{animation:none;}}' +
+                            '</style>').appendTo(document.head || document.documentElement);
+                    }
+                    progressElement = $('<div class="bq-progress"><span class="bq-progress__spinner" aria-hidden="true"></span>' +
+                        '<span class="bq-progress__text" role="status" aria-live="polite"></span><span class="bq-progress__time" aria-hidden="true"></span></div>').appendTo(document.body);
+                }
+                var label = progressElement.find('.bq-progress__text');
+                if (label.text() !== progressState.message) label.text(progressState.message);
+                progressElement.find('.bq-progress__time').text(Math.floor((Date.now() - progressState.since) / 1000) + ' с');
+            }
+            else Lampa.Noty.show(escapeText(progressState.message), { time: 3000 });
+            progressTimer = setTimeout(render, 1000);
+        }
+        render();
     }
     window.bq_dispose = function () {
         beginOperation();
@@ -167,6 +213,12 @@
         if (v === false || v === 'false') return 'any';
         return ['ukr', 'ukr_rus', 'rus', 'any'].indexOf(v) >= 0 ? v : 'ukr';
     }
+
+    function requiredVoice() {
+        var voice = voiceMode();
+        return voice === 'ukr' || voice === 'rus' ? voice : '';
+    }
+    function voiceName(voice) { return voice === 'rus' ? 'староукраїнську' : 'українську'; }
 
     function trackLanguage(track) {
         track = track || {};
@@ -503,7 +555,7 @@
             else if (hasRus) score += 40;
         }
         else if (vp === 'rus') {
-            // Спершу російська, потім автоматичні запасні варіанти.
+            // Мовний фільтр обов'язковий; цей бонус ранжує допущені релізи.
             if (hasRus) score += 120;
             // Двомовний реліз годиться, але однодоріжковий RUS кращий
             if (hasUkr) score -= 90;
@@ -696,7 +748,11 @@
     function tsUrl() {
         var u = '';
         try { u = Lampa.Torserver.url(); } catch (e) {}
-        if (!u) u = Lampa.Storage.get('torrserver_url', '');
+        if (!u) {
+            var one = Lampa.Storage.get('torrserver_url', '');
+            var two = Lampa.Storage.get('torrserver_url_two', '');
+            u = Lampa.Storage.get('torrserver_use_link', 'one') === 'two' ? two || one : one || two;
+        }
         u = String(u || '').trim();
         if (u && !/^https?:\/\//i.test(u)) u = 'http://' + u;
         return u.replace(/\/+$/, '');
@@ -704,66 +760,95 @@
 
     // POST на /torrents з JSON-тілом
     function tsApi(body, done, fail) {
-        var url = tsUrl();
-        function problem(message, terminal) { return { message: message, terminal: !!terminal }; }
+        var url = serverAddress || (serverAddress = tsUrl());
+        function problem(message, terminal, retryable) { return { message: message, terminal: !!terminal, retryable: !!retryable }; }
         if (!url) return fail(problem('Не вказано адресу TorrServe', true));
         if (!/^https?:\/\/[^\s/?#]+(?:\/[^\s?#]*)?$/i.test(url) || /@/.test(url)) {
             return fail(problem('Некоректна адреса TorrServe', true));
         }
-        var xhr, settled = false, untrack = function () {};
+        var xhr, retryTimer, attempt = 0, settled = false, untrack = function () {};
+        var retryMessage = 'Відновлюю зв’язок із TorrServe…', previousPhase = '';
+        function restorePhase() {
+            if (previousPhase && progressState && progressState.message === retryMessage) showProgress(previousPhase);
+        }
         function finish(error, data) {
             if (settled) return;
-            settled = true; untrack();
+            settled = true; clearTimeout(retryTimer); untrack();
+            restorePhase();
             if (error) fail(error); else done(data);
         }
-        try {
-        xhr = new XMLHttpRequest();
-        xhr.open('POST', url + '/torrents', true);
-        xhr.setRequestHeader('Content-Type', 'application/json');
-        xhr.timeout = 15000;
-
-        var auth = Lampa.Storage.get('torrserver_auth', false);
-        if (auth === true || auth === 'true') {
-            var login = Lampa.Storage.get('torrserver_login', '');
-            var pass = Lampa.Storage.get('torrserver_password', '');
-            try {
-                xhr.setRequestHeader('Authorization', 'Basic ' +
-                    btoa(unescape(encodeURIComponent(login + ':' + pass))));
-            } catch (e) {}
+        function cancel() {
+            if (settled) return;
+            settled = true; clearTimeout(retryTimer); untrack();
+            try { if (xhr) xhr.abort(); } catch (e) {}
         }
-
-        xhr.onload = function () {
-            if (xhr.status < 200 || xhr.status >= 300) return finish(problem(
-                xhr.status === 401 || xhr.status === 403 ? 'TorrServe відхилив доступ — перевір логін і пароль' :
-                'TorrServe відповів кодом ' + xhr.status, xhr.status === 401 || xhr.status === 403 || xhr.status === 404 || xhr.status === 0));
-            var data;
-            try { data = JSON.parse(xhr.responseText); }
-            catch (e) { return finish(problem('TorrServe повернув некоректну відповідь', true)); }
-            finish(null, data);
-        };
-        xhr.onerror = function () { finish(problem('Немає зв’язку з TorrServe. Перевір адресу, мережу та доступ із цього пристрою', true)); };
-        xhr.ontimeout = function () { finish(problem('TorrServe не відповів за 15 с', true)); };
-        untrack = trackRequest(function () { settled = true; xhr.abort(); });
-        xhr.send(JSON.stringify(body));
-        } catch (e) { finish(problem('Не вдалося виконати запит до TorrServe', true)); }
+        untrack = trackRequest(cancel);
+        function send() {
+            if (settled) return;
+            attempt++;
+            var completed = false;
+            function receive(error, data) {
+                if (completed || settled) return;
+                completed = true;
+                // Repeat the same operation once, never a different server/release.
+                if (error && error.retryable && attempt < 2 && (body.action === 'get' || body.action === 'add')) {
+                    lastReport.reconnects = (lastReport.reconnects || 0) + 1;
+                    if (progressState) { previousPhase = progressState.message; showProgress(retryMessage); }
+                    retryTimer = setTimeout(send, 800);
+                    return;
+                }
+                if (error && error.retryable && attempt > 1) error.message += ' (після повторної спроби)';
+                finish(error, data);
+            }
+            try {
+                var request = new XMLHttpRequest();
+                xhr = request;
+                request.open('POST', url + '/torrents', true);
+                request.setRequestHeader('Content-Type', 'application/json');
+                request.timeout = 15000;
+                var auth = Lampa.Storage.get('torrserver_auth', false);
+                if (auth === true || auth === 'true') {
+                    var login = Lampa.Storage.get('torrserver_login', '');
+                    var pass = Lampa.Storage.get('torrserver_password', '');
+                    request.setRequestHeader('Authorization', 'Basic ' + btoa(unescape(encodeURIComponent(login + ':' + pass))));
+                }
+                request.onload = function () {
+                    var status = request.status;
+                    var temporary = status === 0 || status === 502 || status === 503 || status === 504;
+                    if (status < 200 || status >= 300) return receive(problem(
+                        status === 401 || status === 403 ? 'TorrServe відхилив доступ — перевір логін і пароль' :
+                        'TorrServe відповів кодом ' + status, status === 401 || status === 403 || status === 404 || temporary, temporary));
+                    var data;
+                    try { data = JSON.parse(request.responseText); }
+                    catch (e) { return receive(problem('TorrServe повернув некоректну відповідь', true)); }
+                    receive(null, data);
+                };
+                request.onerror = function () { receive(problem('Немає зв’язку з TorrServe. Перевір адресу, мережу та доступ із цього пристрою', true, true)); };
+                request.ontimeout = function () { receive(problem('TorrServe не відповів за 15 с', true, true)); };
+                request.send(JSON.stringify(body));
+            } catch (e) { receive(problem('Не вдалося виконати запит до TorrServe', true)); }
+        }
+        send();
+        return cancel;
     }
 
     // Чекаємо, поки торрент підтягне метадані і віддасть список файлів
     function waitFiles(hash, done, fail) {
-        var requestId = operation, finished = false, next;
+        var requestId = operation, finished = false, next, cancelRequest;
         var deadline = setTimeout(function () { finish(null, 'Метадані не отримано за 20 с'); }, 20000);
         var untrack = trackRequest(function () { finish(null, 'Скасовано'); });
         function finish(files, error) {
             if (finished) return;
             finished = true;
             clearTimeout(deadline); clearTimeout(next);
+            if (typeof cancelRequest === 'function') cancelRequest();
             untrack();
             if (!current(requestId)) return;
             if (error) fail(error); else done(files);
         }
         function poll() {
             if (finished || !current(requestId)) return finish(null, 'Скасовано');
-            tsApi({ action: 'get', hash: hash }, function (data) {
+            cancelRequest = tsApi({ action: 'get', hash: hash }, function (data) {
                 if (finished) return;
                 var files = data && data.file_stats;
                 if (Array.isArray(files) && files.length) return finish(files);
@@ -895,19 +980,20 @@
     // Продовження зі збереженої роздачі; якщо вона померла — звичайний пошук
     function resumeSaved(saved) {
         var requestId = beginOperation();
+        lastReport = { status: 'Продовження перегляду', found: 0, candidates: 0, tried: 0, reasons: {} };
         if (!saved || !saved.card) return report('Збережений запис пошкоджено');
         var card = saved.card;
         var opts = { season: saved.season || 0, episode: saved.episode || episodeOf(saved.epTitle),
             path: saved.path || saved.epTitle, hash: saved.hash, episodeIndex: saved.epIndex, position: saved.position || 0 };
-        var language = voiceMode();
-        if (language === 'ukr' && !(saved.languages && saved.languages.ukr)) return findBest(card, true, opts);
+        var required = requiredVoice();
+        if (required && !(saved.languages && saved.languages[required])) return findBest(card, true, opts);
 
-        curIsSeries = true;
+        curIsSeries = isSeriesCard(card);
         curSeason = saved.season || 0;
         curMaxSeason = parseInt(card.number_of_seasons, 10) || 0;
         curRuntime = parseInt(card.runtime, 10) || 0;
 
-        Lampa.Noty.show('Відновлюю: ' + (saved.epTitle || 'останню серію'));
+        showProgress('Відновлюю: ' + (saved.epTitle || 'останню серію'));
 
         playInTorrserve({ MagnetUri: saved.link, Title: saved.releaseTitle || '',
             Audio: saved.languages ? (saved.languages.ukr ? 'ukr ' : '') + (saved.languages.rus ? 'rus' : '') : '' }, card, function (retryOpts, error) {
@@ -924,7 +1010,7 @@
         var w = cfg('warm', 'true');
         if (!(w === true || w === 'true')) return done();
 
-        var finished = false, requestId = operation;
+        var finished = false, requestId = operation, cancelRequest, next;
         var t0 = Date.now();
         var lastPre = -1, stallAt = Date.now();
         var deadline = setTimeout(finish, 12000);
@@ -944,6 +1030,8 @@
             if (finished) return;
             finished = true;
             clearTimeout(deadline);
+            clearTimeout(next);
+            if (typeof cancelRequest === 'function') cancelRequest();
             untrack();
             try { xhr.abort(); } catch (e) {}
             if (current(requestId)) done();
@@ -955,7 +1043,7 @@
             // Жорстка стеля 12 с — краще легкий фриз на старті, ніж довге чекання
             if (Date.now() - t0 > 12000) return finish();
 
-            tsApi({ action: 'get', hash: hash }, function (t) {
+            cancelRequest = tsApi({ action: 'get', hash: hash }, function (t) {
                 if (finished) return;
                 if (!current(requestId)) return finish();
                 var pre = t && t.preloaded_bytes, size = t && t.preload_size;
@@ -966,7 +1054,7 @@
                 }
                 else {
                     var pct = Math.min(100, Math.round(pre * 100 / size));
-                    Lampa.Noty.show('Буферизація ' + pct + '%…');
+                    showProgress('Буферизація ' + pct + '%…');
 
                     // 50% буфера достатньо для гладкого старту
                     if (pct >= 50) return finish();
@@ -976,7 +1064,7 @@
                     else if (Date.now() - stallAt > 5000) return finish();
                 }
 
-                setTimeout(poll, 1500);
+                next = setTimeout(poll, 1500);
             }, finish);
         })();
     }
@@ -1000,6 +1088,7 @@
             videoRemovers = [];
         }
         function cleanup() {
+            stopProgress();
             clearVideo(); active = null;
             removers.forEach(function (remove) { remove(); });
             removers = [];
@@ -1017,7 +1106,7 @@
             if (!series) return;
             contSave(card, { season: season, episode: data.bq_episode, epIndex: data.bq_index,
                 epTitle: data.title, path: data.path, hash: hash, position: data.bq_position || 0,
-                link: item.MagnetUri || item.Link, languages: releaseLanguages(item),
+                link: item.MagnetUri || item.Link, languages: data.bq_languages || releaseLanguages(item),
                 releaseTitle: item.Title, verified: verified });
         }
         function fail(data, reason) {
@@ -1027,6 +1116,7 @@
                 episodeIndex: data.bq_index, position: data.bq_position || 0 };
             cleanup();
             try { if (player.close) player.close(); } catch (e) {}
+            showProgress('Цей реліз не підійшов — перевіряю наступний…');
             setTimeout(function () {
                 if (current(requestId)) onDead(retry, { message: reason, reason: 'playback' });
             }, 250);
@@ -1041,15 +1131,18 @@
             clearVideo(); active = data; failed = false; external = false;
             lastTime = null; progressed = 0; lastSaved = -15000;
             listen(video && video.listener, 'tracks', function (event) {
-                if (!owns(data) || voice === 'any') return;
+                if (!owns(data)) return;
                 var tracks = event && event.tracks || [], ukr = -1, rus = -1;
                 for (var i = 0; i < tracks.length; i++) {
                     var lang = trackLanguage(tracks[i]);
                     if (lang === 'ukr' && ukr < 0) ukr = i;
                     if (lang === 'rus' && rus < 0) rus = i;
                 }
+                if (tracks.length) data.bq_languages = { ukr: ukr >= 0, rus: rus >= 0 };
+                if (voice === 'any') return;
                 var target = voice === 'rus' ? rus : ukr >= 0 ? ukr : voice === 'ukr_rus' ? rus : -1;
-                if (target < 0 && tracks.length && voice === 'ukr') return fail(data, 'У файлі не підтверджено українську аудіодоріжку');
+                if (target < 0 && tracks.length && (voice === 'ukr' || voice === 'rus'))
+                    return fail(data, 'У файлі не підтверджено ' + voiceName(voice) + ' аудіодоріжку');
                 if (target >= 0) {
                     try {
                         // Disable others before enabling the target: HLS/DASH use setters.
@@ -1069,13 +1162,17 @@
                 if (lastTime !== null && now > lastTime && now - lastTime < 5) progressed += now - lastTime;
                 lastTime = now; data.bq_position = now;
                 if (progressed >= 3) {
+                    stopProgress();
                     clearTimeout(timer);
                     lastReport.status = 'Вбудований плеєр відтворює відео';
                     if (Date.now() - lastSaved >= 15000) { remember(data, true); lastSaved = Date.now(); }
                 }
             }, videoRemovers);
-            listen(video && video.listener, 'pause', function () { clearTimeout(timer); }, videoRemovers);
-            listen(video && video.listener, 'play', function () { arm(data); }, videoRemovers);
+            listen(video && video.listener, 'pause', function () { clearTimeout(timer); stopProgress(); }, videoRemovers);
+            listen(video && video.listener, 'play', function () {
+                if (progressed < 3 && owns(data)) showProgress('Запускаю відео…');
+                arm(data);
+            }, videoRemovers);
         }
         playlist.forEach(function (data) {
             data.error = function () { fail(data, 'Плеєр повідомив про помилку відтворення'); };
@@ -1086,15 +1183,20 @@
             else cleanup();
         }, removers);
         listen(player.listener, 'ready', function (data) {
-            if (active && (!data || data === active || data.url === active.url)) arm(active);
+            if (active && (!data || data === active || data.url === active.url)) {
+                if (progressed < 3 && owns(active)) showProgress('Запускаю відео…');
+                arm(active);
+            }
         }, removers);
         listen(player.listener, 'external', function (data) {
             if (playlist.indexOf(data) < 0 || !current(requestId)) return;
             clearVideo(); external = true;
+            stopProgress();
             remember(data, false);
             lastReport.status = 'Передано зовнішньому плеєру; відтворення й доріжку він не підтверджує';
         }, removers);
         listen(player.listener, 'destroy', function () {
+            stopProgress();
             if (active && !failed && !external && progressed >= 3) remember(active, true);
             clearVideo(); active = null;
         }, removers);
@@ -1116,6 +1218,9 @@
             else report(error.message);
         }
         if (!link) return reject('У релізу немає посилання');
+        var required = requiredVoice();
+        if (required && !releaseLanguages(item)[required]) return reject({ message: 'Реліз не підтверджує ' + voiceName(required) + ' озвучку', reason: 'language' });
+        showProgress('Підключаю реліз до TorrServe…');
         tsApi({ action: 'add', link: link, title: title,
             poster: card.poster_path && Lampa.Api && Lampa.Api.img ? Lampa.Api.img(card.poster_path) : '',
             save_to_db: false
@@ -1123,6 +1228,7 @@
             if (ended || !current(requestId)) return;
             var hash = torrent && torrent.hash;
             if (!hash) return reject('TorrServe не повернув хеш роздачі');
+            showProgress('Отримую список відеофайлів…');
             waitFiles(hash, function (files) {
                 if (ended || !current(requestId)) return;
                 var videos = files.map(function (f, index) {
@@ -1152,7 +1258,7 @@
                     var timelineKey = series && season && episode ? cardKey(card) + ':s' + season + ':e' + episode : hash + '_' + f.id;
                     var timeline;
                     try { timeline = Lampa.Timeline.view(timelineKey); } catch (e) { timeline = card.timeline; }
-                    return { url: tsUrl() + '/stream/' + encodeURIComponent(baseName(f.path)) +
+                    return { url: (serverAddress || tsUrl()) + '/stream/' + encodeURIComponent(baseName(f.path)) +
                         '?link=' + encodeURIComponent(hash) + '&index=' + encodeURIComponent(f.id) + '&play',
                         title: series ? baseName(f.path) : title, path: f.path, torrent_hash: hash,
                         timeline: timeline, quality: false, card: card, ffprobe: Array.isArray(item.ffprobe) ? item.ffprobe : undefined,
@@ -1171,10 +1277,12 @@
                         data.timeline.time = opts.position;
                         data.bq_position = opts.position;
                     }
+                    showProgress('Готую відео до запуску…');
                     warmUp(hash, data.url, function () {
                         if (ended || !current(requestId)) return;
                         var activate = watchPlayback(playlist, card, item, hash, season, function (retry, error) { reject(error, retry); });
                         activate(data);
+                        showProgress('Запускаю відео…');
                         try {
                             Lampa.Player.play(data);
                             Lampa.Player.playlist(playlist);
@@ -1194,6 +1302,7 @@
                     return playEpisode(chosen);
                 }
                 if (!series || playlist.length === 1) return playEpisode(0);
+                stopProgress();
                 Lampa.Select.show({ title: 'Яка серія?',
                     items: playlist.map(function (data, index) { return { title: escapeText(data.title), index: index }; }),
                     onSelect: function (selected) { Lampa.Controller.toggle('content'); playEpisode(selected.index); },
@@ -1219,8 +1328,6 @@
         curMaxSeason = parseInt(card.number_of_seasons, 10) || 0;
         curYear = parseInt(String(card.release_date || card.first_air_date || '').slice(0, 4), 10) || 0;
 
-        Lampa.Noty.show('Шукаю найкращий реліз…');
-
         // Знайомий серіал: пропонуємо продовжити з місця зупинки
         var saved = curIsSeries && !skipSaved ? contGet(card) : null;
         if (saved && saved.link) {
@@ -1245,6 +1352,7 @@
 
         function doSearch() {
             if (!current(requestId)) return;
+            showProgress('Шукаю найкращий реліз…');
             var translated = {}, remaining = 2;
             ['ru', 'uk'].forEach(function (language) {
                 localizedTitle(card, language, function (text) {
@@ -1328,7 +1436,7 @@
                 route(merged, card, target);
             }
 
-            if (!queries.length) return Lampa.Noty.show('У картки немає назви для пошуку');
+            if (!queries.length) return report('У картки немає назви для пошуку');
             // Не більше двох одночасних запитів; кожний має власний таймер.
             var next = 0;
             function launch() {
@@ -1379,7 +1487,7 @@
             curSeason = season;
             var filtered = filterBySeason(list, season);
 
-            if (!filtered.length) return Lampa.Noty.show('Роздач сезону ' + season + ' не знайшлося');
+            if (!filtered.length) return report('Роздач сезону ' + season + ' не знайшлося');
 
             pick(filtered, card, target);
         }
@@ -1387,6 +1495,7 @@
         if (target.season > 0) return go(Number(target.season));
 
         if (seasons.length > 1) {
+            stopProgress();
             Lampa.Select.show({
                 title: 'Який сезон?',
                 items: seasons.map(function (n) { return { title: 'Сезон ' + n, season: n }; }),
@@ -1442,14 +1551,14 @@
 
     function pick(list, card, target) {
         if (!list.length) return report('Роздач цього сезону не знайшлося');
-        var voice = voiceMode(), maxGb = sizeLimit();
+        var voice = voiceMode(), required = requiredVoice(), maxGb = sizeLimit();
         var candidates = list.map(normalizeResult).filter(Boolean).filter(function (item) {
             delete item._why; delete item._relaxed;
             item._score = scoreRelease(item);
             if (!item.MagnetUri && !item.Link) item._why = 'link';
             if (!curIsSeries && maxGb > 0 && item.Size / 1073741824 > maxGb) item._why = 'size';
             var lang = releaseLanguages(item);
-            if (voice === 'ukr' && !lang.ukr) item._why = 'language';
+            if (required && !lang[required]) item._why = 'language';
             if (item._why) {
                 lastReport.reasons[item._why] = (lastReport.reasons[item._why] || 0) + 1;
                 return false;
@@ -1470,7 +1579,7 @@
         if (!candidates.length) {
             var why = lastReport.reasons;
             return report('Не підійшов жоден із ' + list.length + ' релізів. ' +
-                (why.language ? 'Без підтвердженої української: ' + why.language + '. ' : '') +
+                (why.language ? 'Не підтверджено ' + voiceName(required) + ' озвучку: ' + why.language + '. ' : '') +
                 (why.size ? 'Перевищують ліміт розміру: ' + why.size + '. ' : '') +
                 (why.hdr ? 'HDR/DV відсіяно: ' + why.hdr + '. ' : '') +
                 (why.link ? 'Немає посилання: ' + why.link + '. ' : '') +
@@ -1487,8 +1596,9 @@
         }
         var best = candidates[idx], settled = false;
         lastReport.tried++;
-        report((best._relaxed ? 'Запасна якість · ' : '') + 'Перевіряю ' + (idx + 1) + '/' + Math.min(candidates.length, 12) +
-            ': ' + escapeText(best.Title) + ' · ' + best.Seeders + ' сідів');
+        lastReport.release = best.Title;
+        showProgress((best._relaxed ? 'Запасна якість · ' : '') + 'Перевіряю ' + (idx + 1) + '/' + Math.min(candidates.length, 12) +
+            ': ' + best.Title + ' · ' + best.Seeders + ' сідів');
         playInTorrserve(best, card, function (retryOpts, error) {
             if (settled || !current(requestId)) return;
             settled = true;
@@ -1583,8 +1693,8 @@
 
         Lampa.SettingsApi.addParam({
             component: 'best_quality',
-            param: { name: STORE.ukr, type: 'select', values: { ukr: 'Українська (обов’язково)', ukr_rus: 'Українська → російська', rus: 'Російська → інші', any: 'Байдуже' }, default: 'ukr' },
-            field: { name: 'Мова озвучки', description: 'Українська — відсіює релізи без підтвердження мови. Інші пріоритети дозволяють запасні варіанти. Байдуже — без мовних бонусів. Зовнішній плеєр керує доріжками сам' }
+            param: { name: STORE.ukr, type: 'select', values: { ukr: 'Українська (обов’язково)', ukr_rus: 'Українська → староукраїнська', rus: 'Староукраїнська', any: 'Байдуже' }, default: 'ukr' },
+            field: { name: 'Мова озвучки', description: 'Українська та староукраїнська — обов’язкова обрана мова, без автоматичної підміни. Режим зі стрілкою дозволяє запасну мову. Байдуже — будь-яка. Зовнішній плеєр керує доріжками сам' }
         });
 
         Lampa.SettingsApi.addParam({
@@ -1635,6 +1745,8 @@
                     '3d': '3D', series: 'Серіал замість фільму', metadata: 'Метадані / сезон / файли', playback: 'Плеєр / аудіодоріжка', server: 'TorrServe', parser: 'Парсер' };
                 var items = [{ title: escapeText(lastReport.status) },
                     { title: 'Знайдено: ' + lastReport.found + '; кандидатів: ' + lastReport.candidates + '; спроб: ' + lastReport.tried }];
+                if (lastReport.release) items.push({ title: escapeText(lastReport.release) });
+                if (lastReport.reconnects) items.push({ title: 'Повторних з’єднань із TorrServe: ' + lastReport.reconnects });
                 Object.keys(lastReport.reasons).forEach(function (key) { items.push({ title: (names[key] || key) + ': ' + lastReport.reasons[key] }); });
                 if (lastReport.lastFailure) items.push({ title: escapeText(lastReport.lastFailure) });
                 Lampa.Select.show({ title: 'Перевірка · v' + BQ_VERSION, items: items, onSelect: function () {},
