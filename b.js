@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 41;
+    var BQ_VERSION = 42;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -663,6 +663,39 @@
 
     /* ---------- 2. Пошук у Jackett ---------- */
 
+    function movieYear(card) {
+        if (!card || isSeriesCard(card)) return 0;
+        var year = String(card.release_date || card.year || '').match(/^(18\d{2}|19\d{2}|20\d{2})(?:-|$)/);
+        return year ? Number(year[1]) : 0;
+    }
+
+    function movieYears(text, card) {
+        text = String(text || '');
+        // A numeric movie title (e.g. "1917" or "2012") is not its release year.
+        [card && card.title, card && card.original_title].forEach(function (title) {
+            if (/^\d{4}$/.test(String(title || ''))) {
+                text = text.replace(new RegExp('(^|[^0-9])' + title + '(?=$|[^0-9])', 'g'), '$1');
+            }
+        });
+        var years = [], match, re = /(^|[^0-9a-z])(18\d{2}|19\d{2}|20\d{2})(?=$|[^0-9a-z])/ig;
+        while ((match = re.exec(text))) {
+            var year = Number(match[2]);
+            if (years.indexOf(year) === -1) years.push(year);
+        }
+        return years;
+    }
+
+    function movieYearMatches(item, card) {
+        var expected = movieYear(card);
+        if (!expected) return true;
+        var years = movieYears(item.Title, card);
+        // Never use PublishDate: it is the upload date, not the film year.
+        [item.Year, item.year, item.release_year].forEach(function (value) {
+            if (/^(18|19|20)\d{2}$/.test(String(value || '')) && years.indexOf(Number(value)) === -1) years.push(Number(value));
+        });
+        return years.length === 1 && years[0] === expected;
+    }
+
     function normalizeResult(item) {
         if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
         var copy = {};
@@ -1281,6 +1314,7 @@
             else report(error.message);
         }
         if (!link) return reject('У релізу немає посилання');
+        if (!movieYearMatches(item, card)) return reject({ message: 'Реліз не підтверджує рік фільму ' + movieYear(card), reason: 'identity' });
         var required = requiredVoice();
         if (required && !releaseLanguages(item)[required]) return reject({ message: 'Реліз не підтверджує ' + voiceName(required) + ' озвучку', reason: 'language' });
         showProgress('Підключаю реліз до TorrServe…');
@@ -1303,6 +1337,14 @@
                         !/(^|[^a-zа-яіїєґ])(sample|семпл|trailer|трейлер)(?=$|[^a-zа-яіїєґ])/i.test(f.path);
                 });
                 if (!videos.length) return reject('У роздачі немає відеофайлу');
+                var expectedYear = movieYear(card);
+                if (expectedYear) {
+                    videos = videos.filter(function (f) {
+                        var years = movieYears(f.path, card);
+                        return !years.length || (years.length === 1 && years[0] === expectedYear);
+                    });
+                    if (!videos.length) return reject({ message: 'Рік у файлах не відповідає фільму ' + expectedYear, reason: 'identity' });
+                }
                 if (series && season > 0) {
                     var selected = filesForSeason(videos, season, releaseSeasonText(item));
                     if (selected.wrong) return reject('Файли не підтверджують обраний сезон ' + season);
@@ -1624,6 +1666,7 @@
             if (!curIsSeries && maxGb > 0 && item.Size / 1073741824 > maxGb) item._why = 'size';
             var lang = releaseLanguages(item);
             if (required && !lang[required]) item._why = 'language';
+            if (!movieYearMatches(item, card)) item._why = 'identity';
             if (item._why) {
                 lastReport.reasons[item._why] = (lastReport.reasons[item._why] || 0) + 1;
                 return false;
@@ -1644,11 +1687,12 @@
         if (!candidates.length) {
             var why = lastReport.reasons;
             return report('Не підійшов жоден із ' + list.length + ' релізів. ' +
+                (why.identity ? 'Не підтверджено рік фільму ' + movieYear(card) + ': ' + why.identity + '. ' : '') +
                 (why.language ? 'Не підтверджено ' + voiceName(required) + ' озвучку: ' + why.language + '. ' : '') +
                 (why.size ? 'Перевищують ліміт розміру: ' + why.size + '. ' : '') +
                 (why.hdr ? 'HDR/DV відсіяно: ' + why.hdr + '. ' : '') +
                 (why.link ? 'Немає посилання: ' + why.link + '. ' : '') +
-                (!why.language && !why.size && !why.hdr && !why.link ? 'Перевір налаштування якості.' : ''));
+                (!why.identity && !why.language && !why.size && !why.hdr && !why.link ? 'Перевір налаштування якості.' : ''));
         }
         tryCandidate(candidates, 0, card, target);
     }
@@ -1806,7 +1850,7 @@
         Lampa.SettingsApi.addParam({ component: 'best_quality', param: { name: 'bq_last_report', type: 'button' },
             field: { name: 'Остання перевірка', description: 'Стан пошуку, кількість кандидатів і причини відмов' },
             onRender: function (item) { item.on('hover:enter', function () {
-                var names = { language: 'Мова', hdr: 'HDR/DV', size: 'Розмір', link: 'Немає посилання', cam: 'Екранка',
+                var names = { identity: 'Не той або непідтверджений рік фільму', language: 'Мова', hdr: 'HDR/DV', size: 'Розмір', link: 'Немає посилання', cam: 'Екранка',
                     '3d': '3D', series: 'Серіал замість фільму', metadata: 'Метадані / сезон / файли', playback: 'Плеєр / аудіодоріжка', stream: 'Готовність відеопотоку', server: 'TorrServe', parser: 'Парсер' };
                 var items = [{ title: escapeText(lastReport.status) },
                     { title: 'Знайдено: ' + lastReport.found + '; кандидатів: ' + lastReport.candidates + '; спроб: ' + lastReport.tried }];

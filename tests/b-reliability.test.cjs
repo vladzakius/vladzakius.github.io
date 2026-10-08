@@ -808,3 +808,38 @@ test('plain GET fallback aborts immediately after data arrives',()=>{
     calls[0].onerror();const x=calls[1];x.status=200;x.getResponseHeader=()=> 'application/octet-stream';x.onprogress({loaded:8192});
     assert.equal(ready,1);assert(x.aborted);f.tick(30000);assert.equal(ready,1);
 });
+
+const recall2012={title:'Згадати все',original_title:'Total Recall',release_date:'2012-08-02'};
+test('remake year is a hard constraint even when the original has more seeds',()=>{
+ const f=fixture();f.api.pick([release('Total Recall (1990) 1080p','old',{Seeders:999}),release('Total Recall (2012) 720p','new',{Seeders:2})],recall2012);
+ assert.equal(f.requests.length,1);assert.equal(f.requests[0].body.link,'new');assert.equal(f.api.report().reasons.identity,1);
+});
+for(const title of ['Total Recall 1990','Total Recall 1080p','Total Recall 1990-2012','Total Recall 1990 / Remastered 2012'])test('reject unconfirmed or conflicting film year: '+title,()=>{
+ const f=fixture();f.api.pick([release(title,'wrong')],recall2012);assert.equal(f.requests.length,0);assert.equal(f.api.report().reasons.identity,1);
+});
+test('structured release year confirms an otherwise unlabelled movie',()=>{
+ const f=fixture();f.api.pick([release('Total Recall 1080p','correct',{year:2012})],recall2012);assert.equal(f.requests[0].body.link,'correct');
+});
+test('upload date never substitutes for the release year',()=>{
+ const f=fixture();f.api.pick([release('Total Recall 1080p','wrong',{PublishDate:'2012-08-02'})],recall2012);assert.equal(f.requests.length,0);
+});
+test('conflicting structured year cannot override the title year',()=>{
+ const f=fixture();f.api.pick([release('Total Recall 1990','wrong',{Year:2012})],recall2012);assert.equal(f.requests.length,0);
+});
+test('direct playback cannot bypass the movie year guard',()=>{
+ const f=fixture();let error;f.api.playInTorrserve(release('Total Recall 1990','old'),recall2012,(opts,e)=>error=e);assert.equal(f.requests.length,0);assert.equal(error.reason,'identity');
+});
+test('wrong-year files cannot launch under a correct release title',()=>{
+ const f=fixture();let error;f.api.playInTorrserve(release('Total Recall 2012','x'),recall2012,(opts,e)=>error=e);
+ f.requests.shift().done({hash:'x'});f.requests.shift().done({file_stats:[{path:'Total.Recall.1990.mkv',id:1,length:100}]});assert.equal(f.plays.length,0);assert.equal(error.reason,'identity');
+});
+test('only the matching-year movie file survives a mixed file list',()=>{
+ const f=fixture();f.api.playInTorrserve(release('Total Recall 2012','x'),recall2012,()=>assert.fail('unexpected reject'));
+ f.requests.shift().done({hash:'x'});f.requests.shift().done({file_stats:[{path:'Total.Recall.1990.mkv',id:1,length:1000},{path:'Total.Recall.2012.mkv',id:2,length:100}]});assert.match(f.plays[0].url,/index=2/);
+});
+test('numeric film titles are not treated as release years',()=>{
+ const f=fixture();f.api.pick([release('1917 (2019) 1080p','correct')],{title:'1917',release_date:'2019-12-25'});assert.equal(f.requests[0].body.link,'correct');
+});
+test('series season year can differ from series premiere year',()=>{
+ const f=fixture();f.api.state(true,3);f.api.pick([release('Example S03 2025','correct')],{name:'Example',first_air_date:'2022-01-01'});assert.equal(f.requests[0].body.link,'correct');
+});
