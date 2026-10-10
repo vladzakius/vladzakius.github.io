@@ -88,7 +88,7 @@ function playbackFlow(warm = false) {
     f.w.XMLHttpRequest=function(){
         http.push(this);this.open=(method,url)=>{this.method=method;this.url=url;};this.setRequestHeader=(key)=>{if(key==='Range')this.probe=true;};
         this.getResponseHeader=()=>'video/x-matroska';
-        this.send=()=>{if(this.probe){http.splice(http.indexOf(this),1);this.status=206;this.response={byteLength:65536};this.onload();}};this.abort=()=>{this.aborted=true;};
+        this.send=()=>{if(this.probe){http.splice(http.indexOf(this),1);this.status=206;this.response={byteLength:524288};this.onload();}};this.abort=()=>{this.aborted=true;};
     };
     Object.assign(f.w.Lampa.Player,{
         play(data){f.w.Lampa.Player.listener.send('create',{data});active=data;plays.push(data);f.w.Lampa.Player.listener.send('ready',data);},
@@ -156,4 +156,12 @@ test('season and episode dialogs pause the busy indicator until selection',()=>{
     f.respond(0,{hash:'synthetic'});f.respond(1,{file_stats:[{path:'Show.S02E01.mkv',id:1},{path:'Show.S02E02.mkv',id:2}]});
     assert.match(f.selection().title,/серія/);assert.equal(f.$('.bq-progress').length,0);
     f.selection().onSelect({index:1});assert.match(f.$('.bq-progress__text').text(),/Запускаю/);f.progress();f.dom.window.close();
+});
+
+test('replacement action is accessible and is not duplicated across renders or upgrades',()=>{
+ const f=boot();f.render();f.tick(2000);f.render();f.tick(2000);
+ assert.equal(f.$('.view--bq-next').length,1);assert.equal(f.$('.view--bq-next').attr('aria-label'),'Інша роздача');
+ f.$('.view--bq-next').trigger('hover:enter');assert.match(f.notices.at(-1),/Спершу/);
+ f.w.eval(source.replace('var BQ_VERSION = '+version+';', 'var BQ_VERSION = '+(version+1)+';'));
+ f.render();f.tick(2000);assert.equal(f.$('.view--bq-next').length,1);f.dom.window.close();
 });

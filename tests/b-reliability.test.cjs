@@ -51,7 +51,7 @@ function fixture() {
     const exposure = `window.__test = {
         seasonsOfText, extractSeasons, filterBySeason, filesForSeason, isSeriesCard,
         releaseLanguages, scoreRelease, sizeLimit, hdrMode, codecPreference, addSettings,
-        playInTorrserve, waitFiles, warmUp, probeStream, findBest, pick, episodeOf, contAll, contGet, contSave, resumeSaved,
+        replaceRelease, isExcluded, playInTorrserve, waitFiles, warmUp, probeStream, findBest, pick, episodeOf, contAll, contGet, contSave, resumeSaved,
         request: tsApi, parser: search, checkServerConnection, browserProfile, tvMode, voiceMode, mediaText,
         report: function () { return lastReport; },
         state: function (series, season, max) { curIsSeries = series; curSeason = season; curMaxSeason = max || 0; },
@@ -755,23 +755,23 @@ test('legacy and invalid select values migrate to visible supported options',()=
 for (const mode of ['bytes', 'full-response', 'empty', 'html', 'http', 'timeout', 'network', 'cancel']) test('selected stream preflight: '+mode,()=>{
     const f=fixture(),calls=xhrMock(f);let ready=0;const errors=[];
     f.api.probeStream('http://server.invalid/stream/file?link=x&index=3&play',()=>ready++,e=>errors.push(e));
-    const x=calls[0];assert.equal(x.headers.Range,'bytes=0-65535');assert.match(x.url,/index=3/);
+    const x=calls[0];assert.equal(x.headers.Range,'bytes=0-524287');assert.match(x.url,/index=3/);
     x.status=mode==='http'?404:mode==='full-response'?200:206;
     x.getResponseHeader=()=>mode==='html'?'text/html':'video/x-matroska';
     if(mode==='cancel')f.api.cancel();
     else if(mode==='timeout')f.tick(8000);
     else if(mode==='network'){x.onerror();calls[1].onerror();}
     else if(mode==='empty'){x.response={byteLength:0};x.onload();}
-    else x.onprogress({loaded:65536});
+    else x.onprogress({loaded:524288});
     assert.equal(ready,['bytes','full-response'].includes(mode)?1:0);
     assert.equal(errors.length,['bytes','full-response','cancel'].includes(mode)?0:1);
-    assert(x.aborted);x.onprogress({loaded:65536});f.tick(30000);
+    assert(x.aborted);x.onprogress({loaded:524288});f.tick(30000);
     assert.equal(ready,['bytes','full-response'].includes(mode)?1:0);
 });
 test('disabled buffering still checks bytes before handing off',()=>{
     const f=fixture(),calls=xhrMock(f);f.api.hooks(null,null,null,f.api.probeStream);let ready=0;
     f.api.warmUp('x','http://server.invalid/stream?index=2&play',()=>ready++,()=>assert.fail('unexpected failure'));
-    assert.equal(ready,0);const x=calls[0];x.status=206;x.getResponseHeader=()=>'';x.response={byteLength:4096};x.onload();assert.equal(ready,1);
+    assert.equal(ready,0);const x=calls[0];x.status=206;x.getResponseHeader=()=>'';x.response={byteLength:524288};x.onload();assert.equal(ready,1);
 });
 test('preflight supplies configured authentication',()=>{
     const f=fixture(),calls=xhrMock(f);f.storage.torrserver_auth=true;f.storage.torrserver_login='user';f.storage.torrserver_password='pass';
@@ -805,7 +805,7 @@ test('older WebView range rejection falls back once with the original deadline',
 test('plain GET fallback aborts immediately after data arrives',()=>{
     const f=fixture(),calls=xhrMock(f);let ready=0;
     f.api.probeStream('http://server.invalid/stream?index=9&play',()=>ready++,()=>assert.fail('unexpected failure'));
-    calls[0].onerror();const x=calls[1];x.status=200;x.getResponseHeader=()=> 'application/octet-stream';x.onprogress({loaded:8192});
+    calls[0].onerror();const x=calls[1];x.status=200;x.getResponseHeader=()=> 'application/octet-stream';x.onprogress({loaded:524288});
     assert.equal(ready,1);assert(x.aborted);f.tick(30000);assert.equal(ready,1);
 });
 
@@ -842,4 +842,51 @@ test('numeric film titles are not treated as release years',()=>{
 });
 test('series season year can differ from series premiere year',()=>{
  const f=fixture();f.api.state(true,3);f.api.pick([release('Example S03 2025','correct')],{name:'Example',first_air_date:'2022-01-01'});assert.equal(f.requests[0].body.link,'correct');
+});
+
+test('a first burst followed by a stall never passes the larger stream sample',()=>{
+ const f=fixture(),calls=xhrMock(f);let ready=0,errors=[];
+ f.api.probeStream('http://server.invalid/stream?play',()=>ready++,e=>errors.push(e));
+ const x=calls[0];x.status=206;x.getResponseHeader=()=> 'video/mp4';
+ x.onprogress({loaded:65536});assert.equal(ready,0);
+ f.tick(8000);assert.equal(ready,0);assert.equal(errors.length,1);assert(x.aborted);
+ x.onprogress({loaded:524288});assert.equal(ready,0);
+});
+test('sample completes only after cumulative progress reaches 512 KiB',()=>{
+ const f=fixture(),calls=xhrMock(f);let ready=0;
+ f.api.probeStream('http://server.invalid/stream?play',()=>ready++,()=>assert.fail());
+ const x=calls[0];x.status=206;x.getResponseHeader=()=> 'video/mp4';
+ x.onprogress({loaded:65536});f.tick(1000);x.onprogress({loaded:262144});assert.equal(ready,0);
+ x.onprogress({loaded:524288});assert.equal(ready,1);assert(x.aborted);
+});
+test('truncated nonempty sample is rejected',()=>{
+ const f=fixture(),calls=xhrMock(f);let errors=0;
+ f.api.probeStream('http://server.invalid/stream?play',()=>assert.fail(),()=>errors++);
+ const x=calls[0];x.status=206;x.getResponseHeader=()=> 'video/mp4';x.response={byteLength:4096};x.onload();
+ assert.equal(errors,1);
+});
+test('replacement skips rejected release, preserves episode and observed position, expires after 30 minutes',()=>{
+ const f=fixture();f.api.state(true,2);
+ const bad=release('Example S02','bad'),good=release('Example S02 720p','good');
+ f.api.playInTorrserve(bad,card,()=>{},{episode:3});filesReady(f,['Example.S02E03.mp4']);
+ f.videoEvents.send('timeupdate',{current:80});
+ f.playerEvents.send('destroy');
+ f.api.hooks(null,null,(q,done)=>done([bad,good]));
+ f.api.replaceRelease(card);
+ assert.equal(f.requests[0].body.link,'good');
+ assert(f.api.isExcluded(card,bad));assert(!f.api.isExcluded({id:99,title:'Other'},bad));
+ filesReady(f,['Example.S02E01.mp4','Example.S02E03.mp4'],'next');
+ assert.equal(f.plays.length,2);assert.match(f.plays[1].path,/S02E03/);assert.equal(f.plays[1].timeline.time,80);
+ f.api.cancel();f.tick(30*60*1000);assert(!f.api.isExcluded(card,bad));
+});
+test('replacement without previous playback does not start a search',()=>{
+ const f=fixture();f.api.replaceRelease(card);assert.equal(f.requests.length,0);assert.match(f.notices.at(-1),/Спершу/);
+});
+test('replacement refuses to substitute another movie year or language',()=>{
+ const f=fixture();f.storage.bq_voice='rus';
+ const bad=release('Total Recall (2012) RUS','bad');
+ f.api.playInTorrserve(bad,recall2012,()=>{});filesReady(f,['Total.Recall.2012.mkv']);
+ f.api.hooks(null,null,(q,done)=>done([bad,release('Total Recall (1990) RUS','old'),release('Total Recall (2012) UKR','uk')]));
+ f.api.replaceRelease(recall2012);assert.equal(f.requests.length,0);assert.equal(f.api.report().reasons.excluded,1);
+ assert.equal(f.api.report().reasons.identity,1);assert.equal(f.api.report().reasons.language,1);
 });

@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 42;
+    var BQ_VERSION = 43;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -35,6 +35,7 @@
     var curSeason = 0;
     var curYear = 0;
     var operation = 0;
+    var recentPlayback = {}, excludedReleases = {};
     var audioGuardCleanup = null;
     var requestsToCancel = [];
     var serverAddress = '';
@@ -1043,7 +1044,7 @@
     // torrent-wide cache counters alone do not prove that this file delivers bytes.
     function probeStream(url, done, fail) {
         var id = operation, finished = false, xhr;
-        var timer = setTimeout(function () { finish('Потік не віддав дані за 8 с'); }, 8000);
+        var timer = setTimeout(function () { finish('Потік не завантажив перевірочний фрагмент за 8 с'); }, 8000);
         var untrack = trackRequest(function () { finish('Скасовано'); });
         function finish(error) {
             if (finished) return;
@@ -1058,9 +1059,9 @@
             var type = String(xhr.getResponseHeader('Content-Type') || '').toLowerCase();
             if (xhr.status !== 200 && xhr.status !== 206) return finish('Потік: HTTP ' + xhr.status);
             if (/text\/|json|xml|mpegurl/.test(type)) return finish('Сервер повернув відповідь без відеоданих');
-            if (bytes > 0) finish();
+            if (bytes >= 524288) finish();
         }
-        showProgress('Перевіряю надходження відеоданих…');
+        showProgress('Перевіряю завантаження фрагмента відео…');
         function send(useRange) {
             if (finished) return;
             try {
@@ -1070,8 +1071,8 @@
                 request.responseType = 'arraybuffer';
                 // Older WebViews preflight Range, which some TorrServe versions
                 // do not allow. One plain GET fallback shares the same deadline
-                // and is aborted as soon as the first bytes arrive.
-                if (useRange) request.setRequestHeader('Range', 'bytes=0-65535');
+                // and is aborted after the 512 KiB sample arrives.
+                if (useRange) request.setRequestHeader('Range', 'bytes=0-524287');
                 var auth = Lampa.Storage.get('torrserver_auth', false);
                 if (auth === true || auth === 'true') {
                     var login = Lampa.Storage.get('torrserver_login', '');
@@ -1083,14 +1084,14 @@
                 request.onload = function () {
                     if (finished || xhr !== request) return;
                     received(request.response && request.response.byteLength || 0);
-                    if (!finished) finish('Потік повернув порожню відповідь');
+                    if (!finished) finish('Потік повернув неповний перевірочний фрагмент');
                 };
                 request.onerror = function () {
                     if (finished || xhr !== request) return;
                     if (useRange) { request.abort(); send(false); }
                     else finish('Не вдалося прочитати відеопотік');
                 };
-                request.ontimeout = function () { if (xhr === request) finish('Потік не віддав дані за 8 с'); };
+                request.ontimeout = function () { if (xhr === request) finish('Потік не завантажив перевірочний фрагмент за 8 с'); };
                 request.send();
             } catch (e) { finish('Не вдалося перевірити відеопотік'); }
         }
@@ -1225,6 +1226,7 @@
         function activate(data) {
             if (!current(requestId) || active === data) return;
             clearVideo(); active = data; failed = false; external = false;
+            recentPlayback[cardKey(card)] = { item: item, data: data, season: season, hash: hash };
             lastTime = null; progressed = 0; lastSaved = -15000;
             listen(video && video.listener, 'tracks', function (event) {
                 if (!owns(data)) return;
@@ -1420,6 +1422,28 @@
     }
 
     /* ---------- 4. Кнопка на картці фільму ---------- */
+
+    function releaseKey(item) {
+        var match = String(item.MagnetUri || '').match(/xt=urn:btih:([a-z0-9]+)/i);
+        return '$' + String(item.InfoHash || item.infohash || (match && match[1]) ||
+            item.MagnetUri || item.Link || item.Title).toLowerCase();
+    }
+    function isExcluded(card, item) {
+        var key = cardKey(card) + '|' + releaseKey(item);
+        if (excludedReleases[key] > Date.now()) return true;
+        delete excludedReleases[key];
+        return false;
+    }
+    function replaceRelease(card) {
+        var previous = recentPlayback[cardKey(card)];
+        if (!previous) return report('Спершу запусти відео кнопкою «Дивитись»');
+        excludedReleases[cardKey(card) + '|' + releaseKey(previous.item)] = Date.now() + 30 * 60 * 1000;
+        var data = previous.data;
+        var target = { season: previous.season, episode: data.bq_episode,
+            path: data.path, hash: previous.hash, position: data.bq_position || 0 };
+        // No array-index fallback across different releases.
+        findBest(card, true, target);
+    }
 
     function findBest(card, skipSaved, target) {
         var requestId = beginOperation();
@@ -1667,6 +1691,7 @@
             var lang = releaseLanguages(item);
             if (required && !lang[required]) item._why = 'language';
             if (!movieYearMatches(item, card)) item._why = 'identity';
+            if (isExcluded(card, item)) item._why = 'excluded';
             if (item._why) {
                 lastReport.reasons[item._why] = (lastReport.reasons[item._why] || 0) + 1;
                 return false;
@@ -1687,12 +1712,13 @@
         if (!candidates.length) {
             var why = lastReport.reasons;
             return report('Не підійшов жоден із ' + list.length + ' релізів. ' +
+                (why.excluded ? 'Тимчасово виключено невдалі роздачі: ' + why.excluded + '. ' : '') +
                 (why.identity ? 'Не підтверджено рік фільму ' + movieYear(card) + ': ' + why.identity + '. ' : '') +
                 (why.language ? 'Не підтверджено ' + voiceName(required) + ' озвучку: ' + why.language + '. ' : '') +
                 (why.size ? 'Перевищують ліміт розміру: ' + why.size + '. ' : '') +
                 (why.hdr ? 'HDR/DV відсіяно: ' + why.hdr + '. ' : '') +
                 (why.link ? 'Немає посилання: ' + why.link + '. ' : '') +
-                (!why.identity && !why.language && !why.size && !why.hdr && !why.link ? 'Перевір налаштування якості.' : ''));
+                (!why.excluded && !why.identity && !why.language && !why.size && !why.hdr && !why.link ? 'Перевір налаштування якості.' : ''));
         }
         tryCandidate(candidates, 0, card, target);
     }
@@ -1749,12 +1775,20 @@
             else if (row.length) row.prepend(btn);
             else return false;
 
+            render.find('.view--bq-next').remove();
+            var next = $('<div class="full-start__button selector view--bq-next" role="button" aria-label="Інша роздача"><span>Інша роздача</span></div>');
+            next.on('hover:enter', function () {
+                if (window.bq_version === BQ_VERSION) replaceRelease(e.data.movie);
+            });
+            btn.after(next);
+
             // Пульт ходить по колекції контролера, зібраній ДО нашої вставки.
             // collectionAppend у CUB не завжди чіпляє, тому найнадійніше —
             // перезібрати контролер картки: toggle('full') збирає селектори заново.
             setTimeout(function () {
                 try {
                     Lampa.Controller.collectionAppend(btn);
+                    Lampa.Controller.collectionAppend(next);
                     var c = Lampa.Controller.enabled();
                     if (c && c.name === 'full') Lampa.Controller.toggle('full');
                 } catch (err) {}
@@ -1851,7 +1885,7 @@
             field: { name: 'Остання перевірка', description: 'Стан пошуку, кількість кандидатів і причини відмов' },
             onRender: function (item) { item.on('hover:enter', function () {
                 var names = { identity: 'Не той або непідтверджений рік фільму', language: 'Мова', hdr: 'HDR/DV', size: 'Розмір', link: 'Немає посилання', cam: 'Екранка',
-                    '3d': '3D', series: 'Серіал замість фільму', metadata: 'Метадані / сезон / файли', playback: 'Плеєр / аудіодоріжка', stream: 'Готовність відеопотоку', server: 'TorrServe', parser: 'Парсер' };
+                    '3d': '3D', series: 'Серіал замість фільму', metadata: 'Метадані / сезон / файли', playback: 'Плеєр / аудіодоріжка', stream: 'Готовність відеопотоку', excluded: 'Тимчасово виключені роздачі', server: 'TorrServe', parser: 'Парсер' };
                 var items = [{ title: escapeText(lastReport.status) },
                     { title: 'Знайдено: ' + lastReport.found + '; кандидатів: ' + lastReport.candidates + '; спроб: ' + lastReport.tried }];
                 if (lastReport.release) items.push({ title: escapeText(lastReport.release) });
