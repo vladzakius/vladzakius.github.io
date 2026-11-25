@@ -1107,6 +1107,7 @@
         var finished = false, requestId = operation, cancelRequest, next;
         var t0 = Date.now();
         var lastPre = -1, stallAt = Date.now();
+        var hardEnd = t0 + 30000;
         var deadline = setTimeout(function () { finish('Буфер не підготовлено за 12 с'); }, 12000);
         var untrack = trackRequest(finish);
 
@@ -1115,7 +1116,7 @@
         try {
             xhr = new XMLHttpRequest();
             xhr.open('GET', streamUrl + '&preload', true);
-            xhr.timeout = 15000;
+            xhr.timeout = 30000;
             xhr.onload = xhr.onerror = xhr.ontimeout = function () {};
             xhr.send();
         } catch (e) {}
@@ -1138,7 +1139,7 @@
             if (finished) return;
             if (!current(requestId)) return finish();
             // An unready stream must not be handed to an unobservable Android player.
-            if (Date.now() - t0 > 12000) return finish('Буфер не підготовлено за 12 с');
+            if (Date.now() >= hardEnd) return finish('Буфер не підготовлено за 30 с');
 
             cancelRequest = tsApi({ action: 'get', hash: hash }, function (t) {
                 if (finished) return;
@@ -1157,7 +1158,16 @@
                     if (pct >= 50) return finish();
 
                     // A stalled cache is a candidate failure, not playback success.
-                    if (pre > lastPre) { lastPre = pre; stallAt = Date.now(); }
+                    if (pre > lastPre) {
+                        lastPre = pre;
+                        stallAt = Date.now();
+                        if (pre > 0) {
+                            clearTimeout(deadline);
+                            deadline = setTimeout(function () {
+                                finish('Час очікування буфера вичерпано');
+                            }, Math.max(0, Math.min(hardEnd, Math.max(t0 + 12000, stallAt + 6000)) - stallAt));
+                        }
+                    }
                     else if (Date.now() - stallAt > 5000) return finish('Буфер не зростає — перевіряю інший реліз');
                 }
 
