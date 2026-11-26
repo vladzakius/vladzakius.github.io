@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BQ_VERSION = 43;
+    var BQ_VERSION = 44;
 
     // Нова версія має право працювати поверх старої; стара не блокує нову
     if (window.bq_version && window.bq_version >= BQ_VERSION) return;
@@ -672,11 +672,18 @@
 
     function movieYears(text, card) {
         text = String(text || '');
-        // A numeric movie title (e.g. "1917" or "2012") is not its release year.
-        [card && card.title, card && card.original_title].forEach(function (title) {
-            if (/^\d{4}$/.test(String(title || ''))) {
-                text = text.replace(new RegExp('(^|[^0-9])' + title + '(?=$|[^0-9])', 'g'), '$1');
-            }
+        var titles = [card && card.title, card && card.original_title];
+        if (titles.some(function (t) { return /^(wonder woman|диво[- ]жінка|чудо[- ]женщина)\s+1984$/i.test(t || ''); })) {
+            titles.push('Wonder Woman 1984', 'Диво-жінка 1984', 'Чудо-женщина 1984', 'WW1984');
+        }
+        var word = '0-9a-zа-яёіїєґ';
+        titles.forEach(function (title) {
+            if (!/(?:18|19|20)\d{2}/.test(title || '')) return;
+            var parts = String(title).toLowerCase().match(/[0-9a-zа-яёіїєґ]+/gi);
+            if (!parts) return;
+            var gap = '[\\s._:\\-–—]+';
+            var pattern = parts.join(gap);
+            text = text.replace(new RegExp('(^|[^' + word + '])' + pattern + '(?=$|[^' + word + '])', 'gi'), '$1 ');
         });
         var years = [], match, re = /(^|[^0-9a-z])(18\d{2}|19\d{2}|20\d{2})(?=$|[^0-9a-z])/ig;
         while ((match = re.exec(text))) {
