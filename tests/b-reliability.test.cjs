@@ -890,3 +890,17 @@ test('replacement refuses to substitute another movie year or language',()=>{
  f.api.replaceRelease(recall2012);assert.equal(f.requests.length,0);assert.equal(f.api.report().reasons.excluded,1);
  assert.equal(f.api.report().reasons.identity,1);assert.equal(f.api.report().reasons.language,1);
 });
+
+for (const [step, expected] of [[5, 'ready'], [1, 'failed']]) {
+    test('progressive buffer with ' + step + '% per poll: ' + expected, () => {
+        const f = fixture(), outcomes = [];
+        xhrMock(f); f.storage.bq_warm = true;
+        f.api.warmUp('x', 'http://server.invalid/stream?play', () => outcomes.push('ready'), () => outcomes.push('failed'));
+        for (let n = 0; n < 20 && !outcomes.length; n++) {
+            f.requests.shift().done({preloaded_bytes: n * step, preload_size: 100});
+            f.tick(1500);
+            if (n === 7) assert.equal(outcomes.length, 0);
+        }
+        assert.deepEqual(outcomes, [expected]);
+    });
+}
